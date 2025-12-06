@@ -1,0 +1,3853 @@
+PROJECT FILE TREE + CONTENTS
+======================================================================
+
+FILE: rdma/rdma_engine.v
+----------------------------------------------------------------------
+//==============================================================================
+// RDMA Engine - Hardware descriptor queue and DMA controller
+//==============================================================================
+
+`include "../common/config.vh"
+`include "../common/defines.vh"
+
+module rdma_engine (
+    input wire clk,
+    input wire rst_n,
+    
+    // Control interface
+    input wire [31:0]  desc_addr,
+    input wire         desc_valid,
+    output reg         desc_ready,
+    output reg         done,
+    output reg         error,
+    
+    // Memory interface
+    output reg [31:0]        mem_addr,
+    output reg [`VLEN-1:0]   mem_wdata,
+    output reg [`VLEN/8-1:0] mem_wstrb,
+    output reg               mem_valid,
+    output reg               mem_wen,
+    input  wire [`VLEN-1:0]  mem_rdata,
+    input  wire              mem_ready
+);
+
+    // Descriptor queue
+    reg [127:0] desc_queue [`DESC_QUEUE_DEPTH-1:0];
+    reg [`DESC_QUEUE_INDEX_BITS-1:0] queue_head;
+    reg [`DESC_QUEUE_INDEX_BITS-1:0] queue_tail;
+    reg [`DESC_QUEUE_INDEX_BITS-1:0] queue_count;
+    
+    // Current descriptor
+    reg [127:0] current_desc;
+    reg [31:0]  transfer_count;
+    reg [31:0]  src_addr;
+    reg [31:0]  dst_addr;
+    
+    // State machine
+    reg [2:0] state;
+    
+    integer i;
+    
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= `RDMA_IDLE;
+            queue_head <= {`DESC_QUEUE_INDEX_BITS{1'b0}};
+            queue_tail <= {`DESC_QUEUE_INDEX_BITS{1'b0}};
+            queue_count <= {`DESC_QUEUE_INDEX_BITS{1'b0}};
+            desc_ready <= 1'b1;
+            done <= 1'b0;
+            error <= 1'b0;
+            mem_valid <= 1'b0;
+            
+            for (i = 0; i < `DESC_QUEUE_DEPTH; i = i + 1) begin
+                desc_queue[i] <= 128'b0;
+            end
+        end else begin
+            case (state)
+                `RDMA_IDLE: begin
+                    done <= 1'b0;
+                    error <= 1'b0;
+                    mem_valid <= 1'b0;
+                    
+                    // Accept new descriptors
+                    if (desc_valid && queue_count < `DESC_QUEUE_DEPTH) begin
+                        desc_queue[queue_tail] <= {96'b0, desc_addr};
+                        queue_tail <= queue_tail + 1;
+                        queue_count <= queue_count + 1;
+                    end
+                    
+                    // Process queue
+                    if (queue_count > 0) begin
+                        current_desc <= desc_queue[queue_head];
+                        state <= `RDMA_FETCH_DESC;
+                    end
+                    
+                    desc_ready <= (queue_count < `DESC_QUEUE_DEPTH);
+                end
+                
+                `RDMA_FETCH_DESC: begin
+                    // Extract descriptor fields
+                    src_addr <= current_desc[63:32];
+                    dst_addr <= current_desc[95:64];
+                    transfer_count <= {16'b0, current_desc[31:16]};
+                    
+                    if (current_desc[`DESC_VALID]) begin
+                        state <= `RDMA_VALIDATE;
+                    end else begin
+                        error <= 1'b1;
+                        state <= `RDMA_ERROR;
+                    end
+                end
+                
+                `RDMA_VALIDATE: begin
+                    // Simple validation: check alignment
+                    if ((src_addr & 6'h3f) != 0 || (dst_addr & 6'h3f) != 0) begin
+                        error <= 1'b1;
+                        state <= `RDMA_ERROR;
+                    end else begin
+                        state <= `RDMA_TRANSFER;
+                    end
+                end
+                
+                `RDMA_TRANSFER: begin
+                    // Simplified transfer: single beat
+                    if (transfer_count > 0) begin
+                        mem_addr <= src_addr;
+                        mem_valid <= 1'b1;
+                        mem_wen <= 1'b0;
+                        
+                        if (mem_ready) begin
+                            mem_valid <= 1'b0;
+                            state <= `RDMA_UPDATE;
+                        end
+                    end else begin
+                        done <= 1'b1;
+                        queue_head <= queue_head + 1;
+                        queue_count <= queue_count - 1;
+                        state <= `RDMA_IDLE;
+                    end
+                end
+                
+                `RDMA_UPDATE: begin
+                    // Write to destination
+                    mem_addr <= dst_addr;
+                    mem_wdata <= mem_rdata;
+                    mem_wstrb <= {(`VLEN/8){1'b1}};
+                    mem_valid <= 1'b1;
+                    mem_wen <= 1'b1;
+                    
+                    if (mem_ready) begin
+                        mem_valid <= 1'b0;
+                        transfer_count <= transfer_count - 64;
+                        src_addr <= src_addr + 64;
+                        dst_addr <= dst_addr + 64;
+                        state <= `RDMA_TRANSFER;
+                    end
+                end
+                
+                `RDMA_ERROR: begin
+                    queue_head <= queue_head + 1;
+                    queue_count <= queue_count - 1;
+                    state <= `RDMA_IDLE;
+                end
+                
+                default: state <= `RDMA_IDLE;
+            endcase
+        end
+    end
+
+endmodule
+
+FILE: common/defines.vh
+----------------------------------------------------------------------
+//==============================================================================
+// RVV Core Common Defines
+// Instruction opcodes, CSR addresses, and other constants
+//==============================================================================
+
+`ifndef DEFINES_VH
+`define DEFINES_VH
+
+//------------------------------------------------------------------------------
+// RISC-V Base Opcodes (RV32E)
+//------------------------------------------------------------------------------
+`define OPCODE_LOAD     7'b0000011
+`define OPCODE_STORE    7'b0100011
+`define OPCODE_BRANCH   7'b1100011
+`define OPCODE_JAL      7'b1101111
+`define OPCODE_JALR     7'b1100111
+`define OPCODE_OP_IMM   7'b0010011
+`define OPCODE_OP       7'b0110011
+`define OPCODE_LUI      7'b0110111
+`define OPCODE_AUIPC    7'b0010111
+`define OPCODE_SYSTEM   7'b1110011
+
+//------------------------------------------------------------------------------
+// RVV Vector Opcodes
+//------------------------------------------------------------------------------
+`define OPCODE_VECTOR   7'b1010111
+
+// Vector Load/Store width encoding
+`define VLS_WIDTH_8     3'b000
+`define VLS_WIDTH_16    3'b101
+`define VLS_WIDTH_32    3'b110
+`define VLS_WIDTH_64    3'b111
+
+// Vector arithmetic function codes
+`define VFUNCT3_OPIVV   3'b000
+`define VFUNCT3_OPFVV   3'b001
+`define VFUNCT3_OPIVX   3'b100
+`define VFUNCT3_OPFVF   3'b101
+`define VFUNCT3_OPMVX   3'b110
+
+// Vector configuration
+`define VFUNCT3_VSETVLI 3'b111
+`define VFUNCT3_VSETIVLI 3'b111
+
+//------------------------------------------------------------------------------
+// Vector ALU Operations
+//------------------------------------------------------------------------------
+`define VALU_OP_ADD     6'h00
+`define VALU_OP_SUB     6'h02
+`define VALU_OP_MUL     6'h25
+`define VALU_OP_DIV     6'h20
+`define VALU_OP_AND     6'h09
+`define VALU_OP_OR      6'h0A
+`define VALU_OP_XOR     6'h0B
+`define VALU_OP_SLL     6'h25
+`define VALU_OP_SRL     6'h28
+`define VALU_OP_SRA     6'h29
+
+// Fused operations
+`define VALU_OP_MACC    6'h2D
+`define VALU_OP_DOT     6'h30
+`define VALU_OP_LERP    6'h31
+
+//------------------------------------------------------------------------------
+// CSR Addresses
+//------------------------------------------------------------------------------
+// Vector CSRs
+`define CSR_VSTART      12'h008
+`define CSR_VXSAT       12'h009
+`define CSR_VXRM        12'h00A
+`define CSR_VCSR        12'h00F
+`define CSR_VL          12'hC20
+`define CSR_VTYPE       12'hC21
+`define CSR_VLENB       12'hC22
+
+// MMU CSRs
+`define CSR_SATP        12'h180
+`define CSR_MSTATUS     12'h300
+
+//------------------------------------------------------------------------------
+// MMU Definitions
+//------------------------------------------------------------------------------
+// Page table entry flags
+`define PTE_V           0
+`define PTE_R           1
+`define PTE_W           2
+`define PTE_X           3
+`define PTE_U           4
+`define PTE_G           5
+`define PTE_A           6
+`define PTE_D           7
+
+// SATP mode
+`define SATP_MODE_BARE  2'b00
+`define SATP_MODE_SV32  2'b01
+
+//------------------------------------------------------------------------------
+// RDMA Descriptor Fields
+//------------------------------------------------------------------------------
+`define DESC_VALID      0
+`define DESC_DONE       1
+`define DESC_ERROR      2
+`define DESC_SG         3
+
+//------------------------------------------------------------------------------
+// AXI4 Burst Types
+//------------------------------------------------------------------------------
+`define AXI_BURST_FIXED 2'b00
+`define AXI_BURST_INCR  2'b01
+`define AXI_BURST_WRAP  2'b10
+
+//------------------------------------------------------------------------------
+// AXI4 Response Codes
+//------------------------------------------------------------------------------
+`define AXI_RESP_OKAY   2'b00
+`define AXI_RESP_EXOKAY 2'b01
+`define AXI_RESP_SLVERR 2'b10
+`define AXI_RESP_DECERR 2'b11
+
+//------------------------------------------------------------------------------
+// Vector Element Width Encoding (SEW)
+//------------------------------------------------------------------------------
+`define SEW_8           3'b000
+`define SEW_16          3'b001
+`define SEW_32          3'b010
+`define SEW_64          3'b011
+
+//------------------------------------------------------------------------------
+// Vector Register Grouping (LMUL)
+//------------------------------------------------------------------------------
+`define LMUL_1          3'b000
+`define LMUL_2          3'b001
+`define LMUL_4          3'b010
+`define LMUL_8          3'b011
+`define LMUL_F2         3'b101
+`define LMUL_F4         3'b110
+`define LMUL_F8         3'b111
+
+//------------------------------------------------------------------------------
+// State Machine States
+//------------------------------------------------------------------------------
+// Scalar unit states
+`define SCALAR_FETCH    2'b00
+`define SCALAR_DECODE   2'b01
+`define SCALAR_EXECUTE  2'b10
+`define SCALAR_WRITEBACK 2'b11
+
+// MMU states
+`define MMU_IDLE        3'b000
+`define MMU_TLB_LOOKUP  3'b001
+`define MMU_PTW_L1      3'b010
+`define MMU_PTW_L2      3'b011
+`define MMU_UPDATE_TLB  3'b100
+`define MMU_FAULT       3'b101
+
+// RDMA states
+`define RDMA_IDLE       3'b000
+`define RDMA_FETCH_DESC 3'b001
+`define RDMA_VALIDATE   3'b010
+`define RDMA_TRANSFER   3'b011
+`define RDMA_UPDATE     3'b100
+`define RDMA_ERROR      3'b101
+
+`endif
+
+FILE: common/config.vh
+----------------------------------------------------------------------
+//==============================================================================
+// RVV Core Configuration Parameters
+// Based on RISC-V Vector Extension 1.0 Specification
+//==============================================================================
+
+`ifndef CONFIG_VH
+`define CONFIG_VH
+
+// Vector Configuration
+`define VLEN 512
+`define ELEN 64
+`define NUM_VECTOR_REGS 32
+`define NUM_MASK_REGS 8
+
+// Scalar Configuration
+`define XLEN 32
+`define NUM_SCALAR_REGS 16
+
+// Memory Configuration
+`define PADDR_WIDTH 32
+`define VADDR_WIDTH 32
+`define PAGE_SIZE 4096
+`define PAGE_OFFSET_BITS 12
+
+// TLB Configuration
+`define TLB_ENTRIES 16
+`define TLB_INDEX_BITS 4
+
+// RDMA Configuration
+`define DESC_QUEUE_DEPTH 32
+`define DESC_QUEUE_INDEX_BITS 5
+`define MAX_SG_ENTRIES 16
+`define MAX_TRANSFER_SIZE 65536
+
+// AXI4 Configuration
+`define AXI_DATA_WIDTH 512
+`define AXI_ADDR_WIDTH 32
+`define AXI_ID_WIDTH 4
+`define AXI_MAX_BURST_LEN 256
+
+// Stream Buffer Configuration
+`define STREAM_BUFFER_SIZE 4096
+`define NUM_ASYNC_COPY_ENGINES 2
+
+// Pipeline Configuration
+`define SCALAR_PIPELINE_STAGES 2
+`define VECTOR_PIPELINE_STAGES 3
+
+// Cache Configuration (for future expansion)
+`define ICACHE_SIZE 4096
+`define DCACHE_SIZE 2048
+`define CACHE_LINE_SIZE 64
+
+// Timing and Performance
+`define TARGET_FREQ_MHZ 100
+
+`endif
+
+FILE: memory/axi4_master.v
+----------------------------------------------------------------------
+//==============================================================================
+// AXI4 Master Interface
+// Arbitrates between scalar and vector memory requests
+//==============================================================================
+
+`include "../common/config.vh"
+`include "../common/defines.vh"
+
+module axi4_master (
+    input wire clk,
+    input wire rst_n,
+    
+    // Scalar memory requests
+    input wire [31:0]  scalar_addr,
+    input wire [31:0]  scalar_wdata,
+    input wire [3:0]   scalar_wstrb,
+    input wire         scalar_valid,
+    input wire         scalar_wen,
+    output reg [31:0]  scalar_rdata,
+    output reg         scalar_ready,
+    
+    // Vector memory requests
+    input wire [31:0]        vector_addr,
+    input wire [`VLEN-1:0]   vector_wdata,
+    input wire [`VLEN/8-1:0] vector_wstrb,
+    input wire               vector_valid,
+    input wire               vector_wen,
+    output reg [`VLEN-1:0]   vector_rdata,
+    output reg               vector_ready,
+    
+    // AXI4 Write Address Channel
+    output reg [`AXI_ADDR_WIDTH-1:0] axi_awaddr,
+    output reg [7:0]                  axi_awlen,
+    output reg [2:0]                  axi_awsize,
+    output reg [1:0]                  axi_awburst,
+    output reg                        axi_awvalid,
+    input  wire                       axi_awready,
+    
+    // AXI4 Write Data Channel
+    output reg [`AXI_DATA_WIDTH-1:0]      axi_wdata,
+    output reg [`AXI_DATA_WIDTH/8-1:0]    axi_wstrb,
+    output reg                             axi_wlast,
+    output reg                             axi_wvalid,
+    input  wire                            axi_wready,
+    
+    // AXI4 Write Response Channel
+    input  wire [1:0]                 axi_bresp,
+    input  wire                       axi_bvalid,
+    output reg                        axi_bready,
+    
+    // AXI4 Read Address Channel
+    output reg [`AXI_ADDR_WIDTH-1:0] axi_araddr,
+    output reg [7:0]                  axi_arlen,
+    output reg [2:0]                  axi_arsize,
+    output reg [1:0]                  axi_arburst,
+    output reg                        axi_arvalid,
+    input  wire                       axi_arready,
+    
+    // AXI4 Read Data Channel
+    input  wire [`AXI_DATA_WIDTH-1:0] axi_rdata,
+    input  wire [1:0]                  axi_rresp,
+    input  wire                        axi_rlast,
+    input  wire                        axi_rvalid,
+    output reg                         axi_rready
+);
+
+    // State machine
+    reg [3:0] state;
+    localparam IDLE = 4'b0000;
+    localparam SCALAR_READ_ADDR = 4'b0001;
+    localparam SCALAR_READ_DATA = 4'b0010;
+    localparam SCALAR_WRITE_ADDR = 4'b0011;
+    localparam SCALAR_WRITE_DATA = 4'b0100;
+    localparam SCALAR_WRITE_RESP = 4'b0101;
+    localparam VECTOR_READ_ADDR = 4'b0110;
+    localparam VECTOR_READ_DATA = 4'b0111;
+    localparam VECTOR_WRITE_ADDR = 4'b1000;
+    localparam VECTOR_WRITE_DATA = 4'b1001;
+    localparam VECTOR_WRITE_RESP = 4'b1010;
+    
+    // Burst counter for multi-beat transactions
+    reg [7:0] burst_count;
+    reg [7:0] burst_len;
+    
+    // Arbitration: vector has priority
+    wire service_vector = vector_valid;
+    wire service_scalar = scalar_valid && !vector_valid;
+    
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= IDLE;
+            scalar_ready <= 1'b0;
+            vector_ready <= 1'b0;
+            axi_awvalid <= 1'b0;
+            axi_wvalid <= 1'b0;
+            axi_bready <= 1'b1;
+            axi_arvalid <= 1'b0;
+            axi_rready <= 1'b1;
+            burst_count <= 8'b0;
+            burst_len <= 8'b0;
+        end else begin
+            case (state)
+                IDLE: begin
+                    scalar_ready <= 1'b0;
+                    vector_ready <= 1'b0;
+                    burst_count <= 8'b0;
+                    axi_awvalid <= 1'b0;
+                    axi_wvalid <= 1'b0;
+                    axi_arvalid <= 1'b0;
+                    
+                    if (service_vector) begin
+                        if (vector_wen) begin
+                            state <= VECTOR_WRITE_ADDR;
+                            burst_len <= 8'b0; // Single beat for now
+                        end else begin
+                            state <= VECTOR_READ_ADDR;
+                            burst_len <= 8'b0;
+                        end
+                    end else if (service_scalar) begin
+                        if (scalar_wen) begin
+                            state <= SCALAR_WRITE_ADDR;
+                            burst_len <= 8'b0;
+                        end else begin
+                            state <= SCALAR_READ_ADDR;
+                            burst_len <= 8'b0;
+                        end
+                    end
+                end
+                
+                // ===== Scalar Read Transaction =====
+                SCALAR_READ_ADDR: begin
+                    axi_araddr <= scalar_addr;
+                    axi_arlen <= burst_len;
+                    axi_arsize <= 3'b010; // 4 bytes (32-bit)
+                    axi_arburst <= `AXI_BURST_INCR;
+                    axi_arvalid <= 1'b1;
+                    
+                    if (axi_arready && axi_arvalid) begin
+                        axi_arvalid <= 1'b0;
+                        state <= SCALAR_READ_DATA;
+                    end
+                end
+                
+                SCALAR_READ_DATA: begin
+                    axi_rready <= 1'b1;
+                    
+                    if (axi_rvalid && axi_rready) begin
+                        scalar_rdata <= axi_rdata[31:0];
+                        
+                        if (axi_rlast) begin
+                            scalar_ready <= 1'b1;
+                            state <= IDLE;
+                        end else begin
+                            burst_count <= burst_count + 1;
+                        end
+                    end
+                end
+                
+                // ===== Scalar Write Transaction =====
+                SCALAR_WRITE_ADDR: begin
+                    axi_awaddr <= scalar_addr;
+                    axi_awlen <= burst_len;
+                    axi_awsize <= 3'b010; // 4 bytes
+                    axi_awburst <= `AXI_BURST_INCR;
+                    axi_awvalid <= 1'b1;
+                    
+                    if (axi_awready && axi_awvalid) begin
+                        axi_awvalid <= 1'b0;
+                        state <= SCALAR_WRITE_DATA;
+                    end
+                end
+                
+                SCALAR_WRITE_DATA: begin
+                    axi_wdata <= {{(`AXI_DATA_WIDTH-32){1'b0}}, scalar_wdata};
+                    axi_wstrb <= {{(`AXI_DATA_WIDTH/8-4){1'b0}}, scalar_wstrb};
+                    axi_wlast <= (burst_count == burst_len);
+                    axi_wvalid <= 1'b1;
+                    
+                    if (axi_wready && axi_wvalid) begin
+                        if (axi_wlast) begin
+                            axi_wvalid <= 1'b0;
+                            state <= SCALAR_WRITE_RESP;
+                        end else begin
+                            burst_count <= burst_count + 1;
+                        end
+                    end
+                end
+                
+                SCALAR_WRITE_RESP: begin
+                    axi_bready <= 1'b1;
+                    
+                    if (axi_bvalid && axi_bready) begin
+                        // Check response code
+                        if (axi_bresp == `AXI_RESP_OKAY || axi_bresp == `AXI_RESP_EXOKAY) begin
+                            scalar_ready <= 1'b1;
+                        end
+                        state <= IDLE;
+                    end
+                end
+                
+                // ===== Vector Read Transaction =====
+                VECTOR_READ_ADDR: begin
+                    axi_araddr <= vector_addr;
+                    axi_arlen <= burst_len;
+                    axi_arsize <= 3'b110; // 64 bytes (512-bit)
+                    axi_arburst <= `AXI_BURST_INCR;
+                    axi_arvalid <= 1'b1;
+                    
+                    if (axi_arready && axi_arvalid) begin
+                        axi_arvalid <= 1'b0;
+                        state <= VECTOR_READ_DATA;
+                    end
+                end
+                
+                VECTOR_READ_DATA: begin
+                    axi_rready <= 1'b1;
+                    
+                    if (axi_rvalid && axi_rready) begin
+                        vector_rdata <= axi_rdata;
+                        
+                        if (axi_rlast) begin
+                            vector_ready <= 1'b1;
+                            state <= IDLE;
+                        end else begin
+                            burst_count <= burst_count + 1;
+                        end
+                    end
+                end
+                
+                // ===== Vector Write Transaction =====
+                VECTOR_WRITE_ADDR: begin
+                    axi_awaddr <= vector_addr;
+                    axi_awlen <= burst_len;
+                    axi_awsize <= 3'b110; // 64 bytes (512-bit)
+                    axi_awburst <= `AXI_BURST_INCR;
+                    axi_awvalid <= 1'b1;
+                    
+                    if (axi_awready && axi_awvalid) begin
+                        axi_awvalid <= 1'b0;
+                        state <= VECTOR_WRITE_DATA;
+                    end
+                end
+                
+                VECTOR_WRITE_DATA: begin
+                    axi_wdata <= vector_wdata;
+                    axi_wstrb <= vector_wstrb;
+                    axi_wlast <= (burst_count == burst_len);
+                    axi_wvalid <= 1'b1;
+                    
+                    if (axi_wready && axi_wvalid) begin
+                        if (axi_wlast) begin
+                            axi_wvalid <= 1'b0;
+                            state <= VECTOR_WRITE_RESP;
+                        end else begin
+                            burst_count <= burst_count + 1;
+                        end
+                    end
+                end
+                
+                VECTOR_WRITE_RESP: begin
+                    axi_bready <= 1'b1;
+                    
+                    if (axi_bvalid && axi_bready) begin
+                        // Check response code
+                        if (axi_bresp == `AXI_RESP_OKAY || axi_bresp == `AXI_RESP_EXOKAY) begin
+                            vector_ready <= 1'b1;
+                        end
+                        state <= IDLE;
+                    end
+                end
+                
+                default: state <= IDLE;
+            endcase
+        end
+    end
+
+endmodule
+
+FILE: core/vector_alu.v
+----------------------------------------------------------------------
+//==============================================================================
+// Vector ALU - Partitionable 512-bit datapath
+// Supports FP32/FP16/INT32/INT16/INT8 precision modes
+//==============================================================================
+
+`include "../common/config.vh"
+`include "../common/defines.vh"
+
+module vector_alu (
+    input wire clk,
+    input wire rst_n,
+    
+    // Operands
+    input wire [`VLEN-1:0]  op_a,
+    input wire [`VLEN-1:0]  op_b,
+    input wire [`VLEN-1:0]  op_c,
+    
+    // Operation control
+    input wire [5:0]        alu_op,
+    input wire [2:0]        sew,
+    input wire [31:0]       vl,
+    
+    // Mask
+    input wire [`VLEN/8-1:0] mask,
+    input wire              mask_en,
+    
+    // Result
+    output reg [`VLEN-1:0]  result,
+    output reg              valid
+);
+
+    // Element width from SEW
+    wire [6:0] element_width = (sew == `SEW_8)  ? 7'd8  :
+                               (sew == `SEW_16) ? 7'd16 :
+                               (sew == `SEW_32) ? 7'd32 : 7'd64;
+    
+    // Number of elements
+    wire [7:0] num_elements = `VLEN / element_width;
+    
+    integer i;
+    reg [`VLEN-1:0] temp_result;
+    
+    //--------------------------------------------------------------------------
+    // ALU Operations
+    //--------------------------------------------------------------------------
+    always @(*) begin
+        temp_result = {`VLEN{1'b0}};
+        valid = 1'b1;
+        
+        case (sew)
+            `SEW_8: begin
+                for (i = 0; i < 64; i = i + 1) begin
+                    if (i < vl && (!mask_en || mask[i])) begin
+                        case (alu_op)
+                            `VALU_OP_ADD: temp_result[i*8 +: 8] = op_a[i*8 +: 8] + op_b[i*8 +: 8];
+                            `VALU_OP_SUB: temp_result[i*8 +: 8] = op_a[i*8 +: 8] - op_b[i*8 +: 8];
+                            `VALU_OP_AND: temp_result[i*8 +: 8] = op_a[i*8 +: 8] & op_b[i*8 +: 8];
+                            `VALU_OP_OR:  temp_result[i*8 +: 8] = op_a[i*8 +: 8] | op_b[i*8 +: 8];
+                            `VALU_OP_XOR: temp_result[i*8 +: 8] = op_a[i*8 +: 8] ^ op_b[i*8 +: 8];
+                            default: temp_result[i*8 +: 8] = 8'b0;
+                        endcase
+                    end
+                end
+            end
+            
+            `SEW_16: begin
+                for (i = 0; i < 32; i = i + 1) begin
+                    if (i < vl && (!mask_en || mask[i])) begin
+                        case (alu_op)
+                            `VALU_OP_ADD: temp_result[i*16 +: 16] = op_a[i*16 +: 16] + op_b[i*16 +: 16];
+                            `VALU_OP_SUB: temp_result[i*16 +: 16] = op_a[i*16 +: 16] - op_b[i*16 +: 16];
+                            `VALU_OP_AND: temp_result[i*16 +: 16] = op_a[i*16 +: 16] & op_b[i*16 +: 16];
+                            `VALU_OP_OR:  temp_result[i*16 +: 16] = op_a[i*16 +: 16] | op_b[i*16 +: 16];
+                            `VALU_OP_XOR: temp_result[i*16 +: 16] = op_a[i*16 +: 16] ^ op_b[i*16 +: 16];
+                            `VALU_OP_MUL: temp_result[i*16 +: 16] = op_a[i*16 +: 16] * op_b[i*16 +: 16];
+                            default: temp_result[i*16 +: 16] = 16'b0;
+                        endcase
+                    end
+                end
+            end
+            
+            `SEW_32: begin
+                for (i = 0; i < 16; i = i + 1) begin
+                    if (i < vl && (!mask_en || mask[i])) begin
+                        case (alu_op)
+                            `VALU_OP_ADD: temp_result[i*32 +: 32] = op_a[i*32 +: 32] + op_b[i*32 +: 32];
+                            `VALU_OP_SUB: temp_result[i*32 +: 32] = op_a[i*32 +: 32] - op_b[i*32 +: 32];
+                            `VALU_OP_AND: temp_result[i*32 +: 32] = op_a[i*32 +: 32] & op_b[i*32 +: 32];
+                            `VALU_OP_OR:  temp_result[i*32 +: 32] = op_a[i*32 +: 32] | op_b[i*32 +: 32];
+                            `VALU_OP_XOR: temp_result[i*32 +: 32] = op_a[i*32 +: 32] ^ op_b[i*32 +: 32];
+                            `VALU_OP_MUL: temp_result[i*32 +: 32] = op_a[i*32 +: 32] * op_b[i*32 +: 32];
+                            `VALU_OP_MACC: temp_result[i*32 +: 32] = op_c[i*32 +: 32] + (op_a[i*32 +: 32] * op_b[i*32 +: 32]);
+                            default: temp_result[i*32 +: 32] = 32'b0;
+                        endcase
+                    end
+                end
+            end
+            
+            `SEW_64: begin
+                for (i = 0; i < 8; i = i + 1) begin
+                    if (i < vl && (!mask_en || mask[i])) begin
+                        case (alu_op)
+                            `VALU_OP_ADD: temp_result[i*64 +: 64] = op_a[i*64 +: 64] + op_b[i*64 +: 64];
+                            `VALU_OP_SUB: temp_result[i*64 +: 64] = op_a[i*64 +: 64] - op_b[i*64 +: 64];
+                            `VALU_OP_AND: temp_result[i*64 +: 64] = op_a[i*64 +: 64] & op_b[i*64 +: 64];
+                            `VALU_OP_OR:  temp_result[i*64 +: 64] = op_a[i*64 +: 64] | op_b[i*64 +: 64];
+                            `VALU_OP_XOR: temp_result[i*64 +: 64] = op_a[i*64 +: 64] ^ op_b[i*64 +: 64];
+                            default: temp_result[i*64 +: 64] = 64'b0;
+                        endcase
+                    end
+                end
+            end
+        endcase
+    end
+    
+    // Register output
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            result <= {`VLEN{1'b0}};
+        end else begin
+            result <= temp_result;
+        end
+    end
+
+endmodule
+
+FILE: core/vector_config.v
+----------------------------------------------------------------------
+//==============================================================================
+// Vector Configuration Unit
+// Implements vsetvli, vsetivli, vsetvl instructions
+// Calculates vl based on AVL, VLEN, SEW, and LMUL
+//==============================================================================
+
+`include "../common/config.vh"
+`include "../common/defines.vh"
+
+module vector_config (
+    input wire clk,
+    input wire rst_n,
+    
+    // Configuration instruction inputs
+    input wire        cfg_valid,
+    input wire [1:0]  cfg_type,    // 00=vsetvli, 01=vsetivli, 10=vsetvl
+    input wire [31:0] avl,         // Application Vector Length (from rs1 or zimm)
+    input wire [10:0] vtypei,      // vtype immediate field
+    input wire [4:0]  rd_addr,     // Destination register
+    
+    // Current vtype register
+    input wire [31:0] vtype_in,
+    
+    // Outputs
+    output reg [31:0] vl_out,      // Calculated vector length
+    output reg [31:0] vtype_out,   // New vtype value
+    output reg        vl_we,       // Write enable for vl CSR
+    output reg        vtype_we,    // Write enable for vtype CSR
+    output reg [31:0] rd_data,     // Value to write to rd (new vl)
+    output reg        rd_we,       // Write enable for rd
+    output reg        vill         // Illegal vtype indicator
+);
+
+    // Extract vtype fields from vtypei
+    wire       vma_req  = vtypei[7];    // Vector mask agnostic
+    wire       vta_req  = vtypei[6];    // Vector tail agnostic
+    wire [2:0] vsew_req = vtypei[5:3];  // Selected element width
+    wire [2:0] vlmul_req = vtypei[2:0]; // Vector register group multiplier
+    
+    // Extract current vtype fields
+    wire       vill_cur = vtype_in[31];
+    wire [2:0] vsew_cur = vtype_in[5:3];
+    wire [2:0] vlmul_cur = vtype_in[2:0];
+    
+    // Calculate SEW from vsew encoding
+    wire [6:0] sew = (vsew_req == 3'b000) ? 7'd8  :
+                     (vsew_req == 3'b001) ? 7'd16 :
+                     (vsew_req == 3'b010) ? 7'd32 :
+                     (vsew_req == 3'b011) ? 7'd64 : 7'd0; // Invalid
+    
+    // VLMAX calculation: VLMAX = (VLEN / SEW) * LMUL
+    // For fractional LMUL: LMUL = 1/2^n, so VLMAX = (VLEN / SEW) / 2^n
+    reg [31:0] vlmax;
+    wire [31:0] vlen_div_sew = `VLEN / sew;
+    
+    always @(*) begin
+        case (vlmul_req)
+            3'b000: vlmax = vlen_div_sew;        // LMUL = 1
+            3'b001: vlmax = vlen_div_sew << 1;   // LMUL = 2
+            3'b010: vlmax = vlen_div_sew << 2;   // LMUL = 4
+            3'b011: vlmax = vlen_div_sew << 3;   // LMUL = 8
+            3'b101: vlmax = vlen_div_sew >> 1;   // LMUL = 1/2
+            3'b110: vlmax = vlen_div_sew >> 2;   // LMUL = 1/4
+            3'b111: vlmax = vlen_div_sew >> 3;   // LMUL = 1/8
+            default: vlmax = 32'b0;              // Reserved (3'b100)
+        endcase
+    end
+    
+    // Check for illegal vtype combinations
+    wire illegal_sew = (sew == 7'd0) || (sew > `ELEN);
+    wire illegal_lmul = (vlmul_req == 3'b100); // Reserved encoding
+    wire illegal_vtype = illegal_sew || illegal_lmul;
+    
+    // Calculate new vl based on AVL and VLMAX
+    // Rules from RVV spec:
+    // - If AVL <= VLMAX, vl = AVL
+    // - If AVL > VLMAX, vl = VLMAX
+    // - If AVL = 0 and rd != 0, vl = VLMAX
+    // - If AVL = 0 and rd == 0, keep current vl (if vtype unchanged)
+    reg [31:0] new_vl;
+    reg [31:0] current_vl_reg;  // Registered version to avoid combinational loop
+    
+    always @(*) begin
+        if (illegal_vtype) begin
+            new_vl = 32'b0;
+        end else if (avl == 32'b0 && rd_addr == 5'b0 && cfg_type != 2'b01) begin
+            // Special case: rd=x0, rs1=x0 → keep current vl if vtype unchanged
+            if (vtypei == vtype_in[10:0]) begin
+                new_vl = current_vl_reg; // Use registered vl
+            end else begin
+                new_vl = vlmax;
+            end
+        end else if (avl == 32'b0) begin
+            // rd != 0, avl = 0 → set to VLMAX
+            new_vl = vlmax;
+        end else if (avl > vlmax) begin
+            new_vl = vlmax;
+        end else begin
+            new_vl = avl;
+        end
+    end
+    
+    // Update vl and vtype CSRs
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            vl_out <= 32'b0;
+            vtype_out <= 32'b0;
+            vl_we <= 1'b0;
+            vtype_we <= 1'b0;
+            rd_data <= 32'b0;
+            rd_we <= 1'b0;
+            vill <= 1'b0;
+            current_vl_reg <= 32'b0;
+        end else begin
+            // Always capture current vl for retention logic
+            current_vl_reg <= vl_out;
+            
+            if (cfg_valid) begin
+                vill <= illegal_vtype;
+                
+                if (illegal_vtype) begin
+                    // Set vill bit, set vl to 0
+                    vl_out <= 32'b0;
+                    vtype_out <= {1'b1, 31'b0}; // vill = 1
+                    vl_we <= 1'b1;
+                    vtype_we <= 1'b1;
+                    rd_data <= 32'b0;
+                    rd_we <= (rd_addr != 5'b0);
+                end else begin
+                    // Normal configuration
+                    vl_out <= new_vl;
+                    vtype_out <= {1'b0, 23'b0, vma_req, vta_req, vsew_req, vlmul_req};
+                    vl_we <= 1'b1;
+                    vtype_we <= 1'b1;
+                    rd_data <= new_vl; // Write new vl to rd
+                    rd_we <= (rd_addr != 5'b0);
+                end
+            end else begin
+                vl_we <= 1'b0;
+                vtype_we <= 1'b0;
+                rd_we <= 1'b0;
+            end
+        end
+    end
+
+endmodule
+
+FILE: core/vector_regfile.v
+----------------------------------------------------------------------
+//==============================================================================
+// Vector Register File
+// 32 vector registers x 512 bits each, implemented using FPGA block RAM
+//==============================================================================
+
+`include "../common/config.vh"
+
+module vector_regfile (
+    input wire clk,
+    input wire rst_n,
+    
+    // Read port A
+    input wire [4:0]             ra_addr,
+    output reg [`VLEN-1:0]       ra_data,
+    
+    // Read port B
+    input wire [4:0]             rb_addr,
+    output reg [`VLEN-1:0]       rb_data,
+    
+    // Read port C (for 3-operand instructions)
+    input wire [4:0]             rc_addr,
+    output reg [`VLEN-1:0]       rc_data,
+    
+    // Write port
+    input wire [4:0]             w_addr,
+    input wire [`VLEN-1:0]       w_data,
+    input wire                   w_en,
+    
+    // Mask register interface
+    input wire [2:0]             mask_addr,
+    output reg [`VLEN/8-1:0]     mask_data,
+    input wire [2:0]             mask_w_addr,
+    input wire [`VLEN/8-1:0]     mask_w_data,
+    input wire                   mask_w_en
+);
+
+    // Vector register file storage
+    // Implemented as block RAM for FPGA efficiency
+    reg [`VLEN-1:0] vregs [0:31];
+    
+    // Mask register file (8 registers)
+    reg [`VLEN/8-1:0] mask_regs [0:7];
+    
+    integer i;
+    
+    // Read ports (combinational for low latency)
+    always @(*) begin
+        ra_data = vregs[ra_addr];
+        rb_data = vregs[rb_addr];
+        rc_data = vregs[rc_addr];
+        mask_data = mask_regs[mask_addr];
+    end
+    
+    // Write port (synchronous)
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            for (i = 0; i < 32; i = i + 1) begin
+                vregs[i] <= {`VLEN{1'b0}};
+            end
+        end else begin
+            if (w_en) begin
+                vregs[w_addr] <= w_data;
+            end
+        end
+    end
+    
+    // Mask register write
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            for (i = 0; i < 8; i = i + 1) begin
+                mask_regs[i] <= {(`VLEN/8){1'b0}};
+            end
+        end else begin
+            if (mask_w_en) begin
+                mask_regs[mask_w_addr] <= mask_w_data;
+            end
+        end
+    end
+
+endmodule
+
+FILE: core/vector_unit.v
+----------------------------------------------------------------------
+//==============================================================================
+// Vector Unit - Integrates vector register file, ALU, and LSU
+//==============================================================================
+
+`include "../common/config.vh"
+`include "../common/defines.vh"
+
+module vector_unit (
+    input wire clk,
+    input wire rst_n,
+    
+    // Configuration from scalar
+    input wire [31:0] vl_in,
+    input wire        vl_we,
+    input wire [31:0] vtype_in,
+    input wire        vtype_we,
+    
+    // Memory interface
+    output reg [31:0]        mem_addr,
+    output reg [`VLEN-1:0]   mem_wdata,
+    output reg [`VLEN/8-1:0] mem_wstrb,
+    output reg               mem_valid,
+    output reg               mem_wen,
+    input  wire [`VLEN-1:0]  mem_rdata,
+    input  wire              mem_ready
+);
+
+    // Vector CSRs
+    reg [31:0] vl;
+    reg [31:0] vtype;
+    reg [31:0] vstart;
+    
+    // Extract vtype fields
+    wire [2:0] vsew = vtype[5:3];
+    wire [2:0] vlmul = vtype[2:0];
+    wire       vta = vtype[6];
+    wire       vma = vtype[7];
+    
+    // Vector register file ports
+    wire [4:0]             vrf_ra_addr;
+    wire [`VLEN-1:0]       vrf_ra_data;
+    wire [4:0]             vrf_rb_addr;
+    wire [`VLEN-1:0]       vrf_rb_data;
+    wire [4:0]             vrf_rc_addr;
+    wire [`VLEN-1:0]       vrf_rc_data;
+    wire [4:0]             vrf_w_addr;
+    wire [`VLEN-1:0]       vrf_w_data;
+    wire                   vrf_w_en;
+    
+    wire [2:0]             mask_addr;
+    wire [`VLEN/8-1:0]     mask_data;
+    
+    // ALU ports
+    wire [`VLEN-1:0]       alu_op_a;
+    wire [`VLEN-1:0]       alu_op_b;
+    wire [`VLEN-1:0]       alu_op_c;
+    wire [5:0]             alu_op;
+    wire                   alu_valid;
+    wire [`VLEN-1:0]       alu_result;
+    
+    // CSR update
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            vl <= 32'b0;
+            vtype <= 32'b0;
+            vstart <= 32'b0;
+        end else begin
+            if (vl_we) vl <= vl_in;
+            if (vtype_we) vtype <= vtype_in;
+        end
+    end
+    
+    // Instantiate vector register file
+    vector_regfile u_regfile (
+        .clk(clk),
+        .rst_n(rst_n),
+        .ra_addr(vrf_ra_addr),
+        .ra_data(vrf_ra_data),
+        .rb_addr(vrf_rb_addr),
+        .rb_data(vrf_rb_data),
+        .rc_addr(vrf_rc_addr),
+        .rc_data(vrf_rc_data),
+        .w_addr(vrf_w_addr),
+        .w_data(vrf_w_data),
+        .w_en(vrf_w_en),
+        .mask_addr(mask_addr),
+        .mask_data(mask_data),
+        .mask_w_addr(3'b0),
+        .mask_w_data(64'b0),
+        .mask_w_en(1'b0)
+    );
+    
+    // Instantiate vector ALU
+    vector_alu u_alu (
+        .clk(clk),
+        .rst_n(rst_n),
+        .op_a(alu_op_a),
+        .op_b(alu_op_b),
+        .op_c(alu_op_c),
+        .alu_op(alu_op),
+        .sew(vsew),
+        .vl(vl),
+        .mask(mask_data),
+        .mask_en(1'b0),
+        .result(alu_result),
+        .valid(alu_valid)
+    );
+    
+    // Simple connections for basic operation
+    assign vrf_ra_addr = 5'b0;
+    assign vrf_rb_addr = 5'b0;
+    assign vrf_rc_addr = 5'b0;
+    assign vrf_w_addr = 5'b0;
+    assign vrf_w_data = alu_result;
+    assign vrf_w_en = alu_valid;
+    assign mask_addr = 3'b0;
+    assign alu_op_a = vrf_ra_data;
+    assign alu_op_b = vrf_rb_data;
+    assign alu_op_c = vrf_rc_data;
+    assign alu_op = `VALU_OP_ADD;
+    
+    // Memory interface (placeholder)
+    always @(*) begin
+        mem_addr = 32'b0;
+        mem_wdata = {`VLEN{1'b0}};
+        mem_wstrb = {(`VLEN/8){1'b0}};
+        mem_valid = 1'b0;
+        mem_wen = 1'b0;
+    end
+
+endmodule
+
+FILE: core/rvv_core_top.v
+----------------------------------------------------------------------
+//==============================================================================
+// RVV Core Top Module
+// Integrates scalar unit, vector unit, MMU, and RDMA engine
+//==============================================================================
+
+`include "../common/config.vh"
+`include "../common/defines.vh"
+
+module rvv_core_top (
+    input wire clk,
+    input wire rst_n,
+    
+    // AXI4 Master Interface
+    output wire [`AXI_ADDR_WIDTH-1:0] axi_awaddr,
+    output wire [7:0]                  axi_awlen,
+    output wire [2:0]                  axi_awsize,
+    output wire [1:0]                  axi_awburst,
+    output wire                        axi_awvalid,
+    input  wire                        axi_awready,
+    
+    output wire [`AXI_DATA_WIDTH-1:0] axi_wdata,
+    output wire [`AXI_DATA_WIDTH/8-1:0] axi_wstrb,
+    output wire                        axi_wlast,
+    output wire                        axi_wvalid,
+    input  wire                        axi_wready,
+    
+    input  wire [1:0]                  axi_bresp,
+    input  wire                        axi_bvalid,
+    output wire                        axi_bready,
+    
+    output wire [`AXI_ADDR_WIDTH-1:0] axi_araddr,
+    output wire [7:0]                  axi_arlen,
+    output wire [2:0]                  axi_arsize,
+    output wire [1:0]                  axi_arburst,
+    output wire                        axi_arvalid,
+    input  wire                        axi_arready,
+    
+    input  wire [`AXI_DATA_WIDTH-1:0] axi_rdata,
+    input  wire [1:0]                  axi_rresp,
+    input  wire                        axi_rlast,
+    input  wire                        axi_rvalid,
+    output wire                        axi_rready,
+    
+    // Interrupt outputs
+    output wire                        irq_external,
+    output wire                        irq_timer,
+    
+    // Debug interface
+    output wire [31:0]                 debug_pc,
+    output wire                        debug_valid
+);
+
+    // Scalar-Vector interface
+    wire [31:0] scalar_vl_write_data;
+    wire        scalar_vl_write_en;
+    wire [31:0] scalar_vtype_write_data;
+    wire        scalar_vtype_write_en;
+    
+    // Memory request from scalar unit
+    wire [31:0] scalar_mem_addr;
+    wire [31:0] scalar_mem_wdata;
+    wire [3:0]  scalar_mem_wstrb;
+    wire        scalar_mem_valid;
+    wire        scalar_mem_wen;
+    wire [31:0] scalar_mem_rdata;
+    wire        scalar_mem_ready;
+    
+    // Memory request from vector unit
+    wire [31:0] vector_mem_addr;
+    wire [`VLEN-1:0] vector_mem_wdata;
+    wire [`VLEN/8-1:0] vector_mem_wstrb;
+    wire        vector_mem_valid;
+    wire        vector_mem_wen;
+    wire [`VLEN-1:0] vector_mem_rdata;
+    wire        vector_mem_ready;
+    
+    // MMU interface
+    wire [31:0] mmu_vaddr;
+    wire [31:0] mmu_paddr;
+    wire        mmu_req;
+    wire        mmu_wen;
+    wire        mmu_ready;
+    wire        mmu_fault;
+    
+    // RDMA interface
+    wire [31:0] rdma_desc_addr;
+    wire        rdma_desc_valid;
+    wire        rdma_desc_ready;
+    wire        rdma_done;
+    wire        rdma_error;
+    
+    //--------------------------------------------------------------------------
+    // Scalar Unit (RV32E)
+    //--------------------------------------------------------------------------
+    scalar_unit u_scalar (
+        .clk(clk),
+        .rst_n(rst_n),
+        
+        // Memory interface
+        .mem_addr(scalar_mem_addr),
+        .mem_wdata(scalar_mem_wdata),
+        .mem_wstrb(scalar_mem_wstrb),
+        .mem_valid(scalar_mem_valid),
+        .mem_wen(scalar_mem_wen),
+        .mem_rdata(scalar_mem_rdata),
+        .mem_ready(scalar_mem_ready),
+        
+        // Vector CSR interface
+        .vl_write_data(scalar_vl_write_data),
+        .vl_write_en(scalar_vl_write_en),
+        .vtype_write_data(scalar_vtype_write_data),
+        .vtype_write_en(scalar_vtype_write_en),
+        
+        // Debug
+        .debug_pc(debug_pc),
+        .debug_valid(debug_valid)
+    );
+    
+    //--------------------------------------------------------------------------
+    // Vector Unit
+    //--------------------------------------------------------------------------
+    vector_unit u_vector (
+        .clk(clk),
+        .rst_n(rst_n),
+        
+        // Configuration from scalar
+        .vl_in(scalar_vl_write_data),
+        .vl_we(scalar_vl_write_en),
+        .vtype_in(scalar_vtype_write_data),
+        .vtype_we(scalar_vtype_write_en),
+        
+        // Memory interface
+        .mem_addr(vector_mem_addr),
+        .mem_wdata(vector_mem_wdata),
+        .mem_wstrb(vector_mem_wstrb),
+        .mem_valid(vector_mem_valid),
+        .mem_wen(vector_mem_wen),
+        .mem_rdata(vector_mem_rdata),
+        .mem_ready(vector_mem_ready)
+    );
+    
+    //--------------------------------------------------------------------------
+    // MMU
+    //--------------------------------------------------------------------------
+    mmu u_mmu (
+        .clk(clk),
+        .rst_n(rst_n),
+        
+        // Virtual to physical translation
+        .vaddr(mmu_vaddr),
+        .paddr(mmu_paddr),
+        .req(mmu_req),
+        .wen(mmu_wen),
+        .ready(mmu_ready),
+        .fault(mmu_fault),
+        
+        // Page table walker memory interface
+        .ptw_mem_addr(),
+        .ptw_mem_valid(),
+        .ptw_mem_rdata(32'h0),
+        .ptw_mem_ready(1'b1)
+    );
+    
+    //--------------------------------------------------------------------------
+    // RDMA Engine
+    //--------------------------------------------------------------------------
+    rdma_engine u_rdma (
+        .clk(clk),
+        .rst_n(rst_n),
+        
+        // Control interface
+        .desc_addr(rdma_desc_addr),
+        .desc_valid(rdma_desc_valid),
+        .desc_ready(rdma_desc_ready),
+        .done(rdma_done),
+        .error(rdma_error),
+        
+        // Memory interface (connects to AXI)
+        .mem_addr(),
+        .mem_wdata(),
+        .mem_wstrb(),
+        .mem_valid(),
+        .mem_wen(),
+        .mem_rdata(512'h0),
+        .mem_ready(1'b1)
+    );
+    
+    //--------------------------------------------------------------------------
+    // Memory Subsystem with AXI4 Master
+    //--------------------------------------------------------------------------
+    axi4_master u_axi_master (
+        .clk(clk),
+        .rst_n(rst_n),
+        
+        // Scalar memory requests
+        .scalar_addr(scalar_mem_addr),
+        .scalar_wdata(scalar_mem_wdata),
+        .scalar_wstrb(scalar_mem_wstrb),
+        .scalar_valid(scalar_mem_valid),
+        .scalar_wen(scalar_mem_wen),
+        .scalar_rdata(scalar_mem_rdata),
+        .scalar_ready(scalar_mem_ready),
+        
+        // Vector memory requests
+        .vector_addr(vector_mem_addr),
+        .vector_wdata(vector_mem_wdata),
+        .vector_wstrb(vector_mem_wstrb),
+        .vector_valid(vector_mem_valid),
+        .vector_wen(vector_mem_wen),
+        .vector_rdata(vector_mem_rdata),
+        .vector_ready(vector_mem_ready),
+        
+        // AXI4 interface
+        .axi_awaddr(axi_awaddr),
+        .axi_awlen(axi_awlen),
+        .axi_awsize(axi_awsize),
+        .axi_awburst(axi_awburst),
+        .axi_awvalid(axi_awvalid),
+        .axi_awready(axi_awready),
+        
+        .axi_wdata(axi_wdata),
+        .axi_wstrb(axi_wstrb),
+        .axi_wlast(axi_wlast),
+        .axi_wvalid(axi_wvalid),
+        .axi_wready(axi_wready),
+        
+        .axi_bresp(axi_bresp),
+        .axi_bvalid(axi_bvalid),
+        .axi_bready(axi_bready),
+        
+        .axi_araddr(axi_araddr),
+        .axi_arlen(axi_arlen),
+        .axi_arsize(axi_arsize),
+        .axi_arburst(axi_arburst),
+        .axi_arvalid(axi_arvalid),
+        .axi_arready(axi_arready),
+        
+        .axi_rdata(axi_rdata),
+        .axi_rresp(axi_rresp),
+        .axi_rlast(axi_rlast),
+        .axi_rvalid(axi_rvalid),
+        .axi_rready(axi_rready)
+    );
+    
+    // Interrupt assignments
+    assign irq_external = rdma_done | rdma_error;
+    assign irq_timer = 1'b0;
+    
+endmodule
+
+FILE: core/vector_mask_unit.v
+----------------------------------------------------------------------
+//==============================================================================
+// Vector Mask Operations Unit
+// Supports vcpop.m, vfirst.m, vmsbf.m, vmsif.m, vmsof.m, viota.m, vid.v
+// and mask-register logical operations
+//==============================================================================
+
+`include "../common/config.vh"
+`include "../common/defines.vh"
+
+module vector_mask_unit #(
+    parameter VLEN = `VLEN
+)(
+    input wire clk,
+    input wire rst_n,
+    
+    // Control
+    input wire [5:0]       funct6,
+    input wire [4:0]       vs2_op,     // Operation encoding from vs2 field
+    input wire [2:0]       sew,
+    input wire [31:0]      vl,
+    
+    // Operands
+    input wire [VLEN/8-1:0] mask_a,    // First mask operand
+    input wire [VLEN/8-1:0] mask_b,    // Second mask operand
+    input wire [VLEN-1:0]   vec_src,   // Vector source for some ops
+    
+    // Results
+    output reg [VLEN/8-1:0] mask_result,
+    output reg [31:0]       scalar_result,  // For vcpop, vfirst
+    output reg [VLEN-1:0]   vec_result,     // For viota, vid
+    output reg              valid
+);
+
+    integer i;
+    
+    // Mask logical operations
+    always @(*) begin
+        mask_result = {(VLEN/8){1'b0}};
+        scalar_result = 32'b0;
+        vec_result = {VLEN{1'b0}};
+        valid = 1'b1;
+        
+        case (funct6)
+            //------------------------------------------------------------------
+            // Mask-Register Logical Operations (mm suffix)
+            //------------------------------------------------------------------
+            6'h18: mask_result = mask_a & ~mask_b;  // vmandnot.mm
+            6'h19: mask_result = mask_a & mask_b;   // vmand.mm
+            6'h1A: mask_result = mask_a | mask_b;   // vmor.mm
+            6'h1B: mask_result = mask_a ^ mask_b;   // vmxor.mm
+            6'h1C: mask_result = mask_a | ~mask_b;  // vmornot.mm
+            6'h1D: mask_result = ~(mask_a & mask_b); // vmnand.mm
+            6'h1E: mask_result = ~(mask_a | mask_b); // vmnor.mm
+            6'h1F: mask_result = ~(mask_a ^ mask_b); // vmxnor.mm
+            
+            //------------------------------------------------------------------
+            // Mask Population Count and Find-First
+            //------------------------------------------------------------------
+            6'h10: begin // vmunary0 group
+                case (vs2_op)
+                    5'b00010: begin // vcpop.m - Count population of mask
+                        for (i = 0; i < VLEN/8; i = i + 1) begin
+                            if (i < vl && mask_a[i]) begin
+                                scalar_result = scalar_result + 1;
+                            end
+                        end
+                    end
+                    
+                    5'b00011: begin // vfirst.m - Find first set bit
+                        scalar_result = 32'hFFFFFFFF; // Default: -1 (not found)
+                        for (i = 0; i < VLEN/8; i = i + 1) begin
+                            if (i < vl && mask_a[i] && scalar_result == 32'hFFFFFFFF) begin
+                                scalar_result = i;
+                            end
+                        end
+                    end
+                    
+                    default: scalar_result = 32'b0;
+                endcase
+            end
+            
+            //------------------------------------------------------------------
+            // Mask Set-Before-First, Set-Including-First, Set-Only-First
+            //------------------------------------------------------------------
+            6'h12: begin // vmunary0 group (mask transformations)
+                case (vs2_op)
+                    5'b00001: begin // vmsbf.m - Set-before-first
+                        reg first_found;
+                        first_found = 1'b0;
+                        for (i = 0; i < VLEN/8; i = i + 1) begin
+                            if (i < vl) begin
+                                if (!first_found && !mask_a[i]) begin
+                                    mask_result[i] = 1'b1;
+                                end else begin
+                                    first_found = 1'b1;
+                                    mask_result[i] = 1'b0;
+                                end
+                            end
+                        end
+                    end
+                    
+                    5'b00010: begin // vmsif.m - Set-including-first
+                        reg first_found;
+                        first_found = 1'b0;
+                        for (i = 0; i < VLEN/8; i = i + 1) begin
+                            if (i < vl) begin
+                                if (!first_found) begin
+                                    mask_result[i] = 1'b1;
+                                    if (mask_a[i]) begin
+                                        first_found = 1'b1;
+                                    end
+                                end else begin
+                                    mask_result[i] = 1'b0;
+                                end
+                            end
+                        end
+                    end
+                    
+                    5'b00011: begin // vmsof.m - Set-only-first
+                        reg first_found;
+                        first_found = 1'b0;
+                        for (i = 0; i < VLEN/8; i = i + 1) begin
+                            if (i < vl) begin
+                                if (!first_found && mask_a[i]) begin
+                                    mask_result[i] = 1'b1;
+                                    first_found = 1'b1;
+                                end else begin
+                                    mask_result[i] = 1'b0;
+                                end
+                            end
+                        end
+                    end
+                    
+                    //----------------------------------------------------------
+                    // Iota and ID operations
+                    //----------------------------------------------------------
+                    5'b10000: begin // viota.m - Iota (index of set bits)
+                        reg [31:0] count;
+                        count = 32'b0;
+                        case (sew)
+                            `SEW_8: begin
+                                for (i = 0; i < 64; i = i + 1) begin
+                                    if (i < vl) begin
+                                        if (mask_a[i]) begin
+                                            vec_result[i*8 +: 8] = count[7:0];
+                                            count = count + 1;
+                                        end else begin
+                                            vec_result[i*8 +: 8] = 8'b0;
+                                        end
+                                    end
+                                end
+                            end
+                            `SEW_16: begin
+                                for (i = 0; i < 32; i = i + 1) begin
+                                    if (i < vl) begin
+                                        if (mask_a[i]) begin
+                                            vec_result[i*16 +: 16] = count[15:0];
+                                            count = count + 1;
+                                        end else begin
+                                            vec_result[i*16 +: 16] = 16'b0;
+                                        end
+                                    end
+                                end
+                            end
+                            `SEW_32: begin
+                                for (i = 0; i < 16; i = i + 1) begin
+                                    if (i < vl) begin
+                                        if (mask_a[i]) begin
+                                            vec_result[i*32 +: 32] = count;
+                                            count = count + 1;
+                                        end else begin
+                                            vec_result[i*32 +: 32] = 32'b0;
+                                        end
+                                    end
+                                end
+                            end
+                            `SEW_64: begin
+                                for (i = 0; i < 8; i = i + 1) begin
+                                    if (i < vl) begin
+                                        if (mask_a[i]) begin
+                                            vec_result[i*64 +: 64] = {32'b0, count};
+                                            count = count + 1;
+                                        end else begin
+                                            vec_result[i*64 +: 64] = 64'b0;
+                                        end
+                                    end
+                                end
+                            end
+                        endcase
+                    end
+                    
+                    5'b10001: begin // vid.v - Element index
+                        case (sew)
+                            `SEW_8: begin
+                                for (i = 0; i < 64; i = i + 1) begin
+                                    if (i < vl) begin
+                                        vec_result[i*8 +: 8] = i[7:0];
+                                    end
+                                end
+                            end
+                            `SEW_16: begin
+                                for (i = 0; i < 32; i = i + 1) begin
+                                    if (i < vl) begin
+                                        vec_result[i*16 +: 16] = i[15:0];
+                                    end
+                                end
+                            end
+                            `SEW_32: begin
+                                for (i = 0; i < 16; i = i + 1) begin
+                                    if (i < vl) begin
+                                        vec_result[i*32 +: 32] = i;
+                                    end
+                                end
+                            end
+                            `SEW_64: begin
+                                for (i = 0; i < 8; i = i + 1) begin
+                                    if (i < vl) begin
+                                        vec_result[i*64 +: 64] = {32'b0, i[31:0]};
+                                    end
+                                end
+                            end
+                        endcase
+                    end
+                    
+                    default: begin
+                        mask_result = {(VLEN/8){1'b0}};
+                        vec_result = {VLEN{1'b0}};
+                    end
+                endcase
+            end
+            
+            default: begin
+                mask_result = {(VLEN/8){1'b0}};
+                scalar_result = 32'b0;
+                vec_result = {VLEN{1'b0}};
+            end
+        endcase
+    end
+
+endmodule
+
+FILE: core/scalar_unit.v
+----------------------------------------------------------------------
+//==============================================================================
+// Scalar Unit - RV32E Base Integer ISA
+// 2-stage pipeline: Fetch-Decode, Execute
+//==============================================================================
+
+`include "../common/config.vh"
+`include "../common/defines.vh"
+
+module scalar_unit (
+    input wire clk,
+    input wire rst_n,
+    
+    // Memory interface
+    output reg [31:0] mem_addr,
+    output reg [31:0] mem_wdata,
+    output reg [3:0]  mem_wstrb,
+    output reg        mem_valid,
+    output reg        mem_wen,
+    input  wire [31:0] mem_rdata,
+    input  wire       mem_ready,
+    
+    // Vector CSR interface
+    output reg [31:0] vl_write_data,
+    output reg        vl_write_en,
+    output reg [31:0] vtype_write_data,
+    output reg        vtype_write_en,
+    
+    // Debug
+    output wire [31:0] debug_pc,
+    output wire        debug_valid
+);
+
+    // Program counter
+    reg [31:0] pc;
+    reg [31:0] next_pc;
+    
+    // Pipeline registers
+    reg [31:0] fd_pc;
+    reg [31:0] fd_inst;
+    reg        fd_valid;
+    
+    // Register file (RV32E - 16 registers)
+    reg [31:0] regfile [0:15];
+    integer i;
+    
+    // Instruction decode
+    wire [6:0]  opcode = fd_inst[6:0];
+    wire [4:0]  rd     = fd_inst[11:7];
+    wire [2:0]  funct3 = fd_inst[14:12];
+    wire [4:0]  rs1    = fd_inst[19:15];
+    wire [4:0]  rs2    = fd_inst[24:20];
+    wire [6:0]  funct7 = fd_inst[31:25];
+    wire [11:0] csr_addr = fd_inst[31:20];
+    
+    // Immediate generation
+    wire [31:0] imm_i = {{20{fd_inst[31]}}, fd_inst[31:20]};
+    wire [31:0] imm_s = {{20{fd_inst[31]}}, fd_inst[31:25], fd_inst[11:7]};
+    wire [31:0] imm_b = {{19{fd_inst[31]}}, fd_inst[31], fd_inst[7], fd_inst[30:25], fd_inst[11:8], 1'b0};
+    wire [31:0] imm_u = {fd_inst[31:12], 12'b0};
+    wire [31:0] imm_j = {{11{fd_inst[31]}}, fd_inst[31], fd_inst[19:12], fd_inst[20], fd_inst[30:21], 1'b0};
+    
+    // Register read
+    wire [31:0] rs1_data = (rs1 == 5'b0) ? 32'b0 : regfile[rs1];
+    wire [31:0] rs2_data = (rs2 == 5'b0) ? 32'b0 : regfile[rs2];
+    
+    // ALU
+    reg [31:0] alu_result;
+    wire [31:0] alu_op1 = rs1_data;
+    reg [31:0] alu_op2;
+    
+    // Branch condition
+    reg branch_taken;
+    
+    // Control signals
+    reg [2:0] state;
+    localparam S_FETCH = 3'b000;
+    localparam S_DECODE = 3'b001;
+    localparam S_EXECUTE = 3'b010;
+    localparam S_MEM_ACCESS = 3'b011;
+    localparam S_WRITEBACK = 3'b100;
+    
+    reg [31:0] writeback_data;
+    reg [4:0]  writeback_rd;
+    reg        writeback_en;
+    
+    // Load/Store control
+    reg is_load;
+    reg is_store;
+    reg [2:0] mem_funct3;
+    
+    // Decode stage signals
+    wire decode_is_load = (fd_valid && opcode == `OPCODE_LOAD);
+    wire decode_is_store = (fd_valid && opcode == `OPCODE_STORE);
+    
+    //--------------------------------------------------------------------------
+    // Pipeline: Fetch-Decode-Execute State Machine
+    //--------------------------------------------------------------------------
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            pc <= 32'h0;
+            fd_pc <= 32'h0;
+            fd_inst <= 32'h0;
+            fd_valid <= 1'b0;
+            state <= S_FETCH;
+            is_load <= 1'b0;
+            is_store <= 1'b0;
+        end else begin
+            case (state)
+                S_FETCH: begin
+                    mem_addr <= pc;
+                    mem_valid <= 1'b1;
+                    mem_wen <= 1'b0;
+                    mem_wstrb <= 4'b0000;
+                    if (mem_ready) begin
+                        fd_inst <= mem_rdata;
+                        fd_pc <= pc;
+                        fd_valid <= 1'b1;
+                        state <= S_EXECUTE;
+                    end
+                end
+                
+                S_EXECUTE: begin
+                    mem_valid <= 1'b0;
+                    // Register load/store flags from decode
+                    if (decode_is_load) begin
+                        is_load <= 1'b1;
+                        is_store <= 1'b0;
+                        mem_funct3 <= funct3;
+                        state <= S_MEM_ACCESS;
+                    end else if (decode_is_store) begin
+                        is_load <= 1'b0;
+                        is_store <= 1'b1;
+                        mem_funct3 <= funct3;
+                        state <= S_MEM_ACCESS;
+                    end else begin
+                        is_load <= 1'b0;
+                        is_store <= 1'b0;
+                        state <= S_WRITEBACK;
+                    end
+                end
+                
+                S_MEM_ACCESS: begin
+                    if (is_load) begin
+                        mem_addr <= alu_result;
+                        mem_valid <= 1'b1;
+                        mem_wen <= 1'b0;
+                        if (mem_ready) begin
+                            // Load data alignment and sign extension
+                            case (mem_funct3)
+                                3'b000: writeback_data <= {{24{mem_rdata[7]}}, mem_rdata[7:0]};   // LB
+                                3'b001: writeback_data <= {{16{mem_rdata[15]}}, mem_rdata[15:0]}; // LH
+                                3'b010: writeback_data <= mem_rdata;                               // LW
+                                3'b100: writeback_data <= {24'b0, mem_rdata[7:0]};                 // LBU
+                                3'b101: writeback_data <= {16'b0, mem_rdata[15:0]};                // LHU
+                                default: writeback_data <= mem_rdata;
+                            endcase
+                            state <= S_WRITEBACK;
+                        end
+                    end else if (is_store) begin
+                        mem_addr <= alu_result;
+                        mem_valid <= 1'b1;
+                        mem_wen <= 1'b1;
+                        case (mem_funct3)
+                            3'b000: begin // SB
+                                mem_wdata <= {24'b0, rs2_data[7:0]};
+                                mem_wstrb <= 4'b0001;
+                            end
+                            3'b001: begin // SH
+                                mem_wdata <= {16'b0, rs2_data[15:0]};
+                                mem_wstrb <= 4'b0011;
+                            end
+                            3'b010: begin // SW
+                                mem_wdata <= rs2_data;
+                                mem_wstrb <= 4'b1111;
+                            end
+                            default: begin
+                                mem_wdata <= rs2_data;
+                                mem_wstrb <= 4'b1111;
+                            end
+                        endcase
+                        if (mem_ready) begin
+                            state <= S_WRITEBACK;
+                        end
+                    end
+                end
+                
+                S_WRITEBACK: begin
+                    mem_valid <= 1'b0;
+                    if (writeback_en && writeback_rd != 5'b0) begin
+                        regfile[writeback_rd] <= writeback_data;
+                    end
+                    pc <= next_pc;
+                    is_load <= 1'b0;
+                    is_store <= 1'b0;
+                    state <= S_FETCH;
+                end
+                
+                default: state <= S_FETCH;
+            endcase
+        end
+    end
+    
+    //--------------------------------------------------------------------------
+    // Execute Stage: ALU and Control
+    //--------------------------------------------------------------------------
+    always @(*) begin
+        // Defaults
+        alu_op2 = rs2_data;
+        alu_result = 32'b0;
+        branch_taken = 1'b0;
+        next_pc = pc + 4;
+        writeback_data = alu_result;
+        writeback_rd = rd;
+        writeback_en = 1'b0;
+        vl_write_en = 1'b0;
+        vtype_write_en = 1'b0;
+        vl_write_data = 32'b0;
+        vtype_write_data = 32'b0;
+        
+        if (fd_valid) begin
+            case (opcode)
+                `OPCODE_OP_IMM: begin
+                    alu_op2 = imm_i;
+                    case (funct3)
+                        3'b000: alu_result = alu_op1 + alu_op2;
+                        3'b010: alu_result = ($signed(alu_op1) < $signed(alu_op2)) ? 32'b1 : 32'b0;
+                        3'b011: alu_result = (alu_op1 < alu_op2) ? 32'b1 : 32'b0;
+                        3'b100: alu_result = alu_op1 ^ alu_op2;
+                        3'b110: alu_result = alu_op1 | alu_op2;
+                        3'b111: alu_result = alu_op1 & alu_op2;
+                        3'b001: alu_result = alu_op1 << alu_op2[4:0];
+                        3'b101: alu_result = funct7[5] ? ($signed(alu_op1) >>> alu_op2[4:0]) : (alu_op1 >> alu_op2[4:0]);
+                    endcase
+                    writeback_data = alu_result;
+                    writeback_en = 1'b1;
+                end
+                
+                `OPCODE_OP: begin
+                    case (funct3)
+                        3'b000: alu_result = funct7[5] ? (alu_op1 - alu_op2) : (alu_op1 + alu_op2);
+                        3'b001: alu_result = alu_op1 << alu_op2[4:0];
+                        3'b010: alu_result = ($signed(alu_op1) < $signed(alu_op2)) ? 32'b1 : 32'b0;
+                        3'b011: alu_result = (alu_op1 < alu_op2) ? 32'b1 : 32'b0;
+                        3'b100: alu_result = alu_op1 ^ alu_op2;
+                        3'b101: alu_result = funct7[5] ? ($signed(alu_op1) >>> alu_op2[4:0]) : (alu_op1 >> alu_op2[4:0]);
+                        3'b110: alu_result = alu_op1 | alu_op2;
+                        3'b111: alu_result = alu_op1 & alu_op2;
+                    endcase
+                    writeback_data = alu_result;
+                    writeback_en = 1'b1;
+                end
+                
+                `OPCODE_LUI: begin
+                    writeback_data = imm_u;
+                    writeback_en = 1'b1;
+                end
+                
+                `OPCODE_AUIPC: begin
+                    writeback_data = fd_pc + imm_u;
+                    writeback_en = 1'b1;
+                end
+                
+                `OPCODE_JAL: begin
+                    writeback_data = fd_pc + 4;
+                    writeback_en = 1'b1;
+                    next_pc = fd_pc + imm_j;
+                end
+                
+                `OPCODE_JALR: begin
+                    writeback_data = fd_pc + 4;
+                    writeback_en = 1'b1;
+                    next_pc = (rs1_data + imm_i) & ~32'b1;
+                end
+                
+                `OPCODE_BRANCH: begin
+                    case (funct3)
+                        3'b000: branch_taken = (rs1_data == rs2_data);
+                        3'b001: branch_taken = (rs1_data != rs2_data);
+                        3'b100: branch_taken = ($signed(rs1_data) < $signed(rs2_data));
+                        3'b101: branch_taken = ($signed(rs1_data) >= $signed(rs2_data));
+                        3'b110: branch_taken = (rs1_data < rs2_data);
+                        3'b111: branch_taken = (rs1_data >= rs2_data);
+                    endcase
+                    if (branch_taken) next_pc = fd_pc + imm_b;
+                end
+                
+                `OPCODE_LOAD: begin
+                    alu_result = rs1_data + imm_i;
+                    writeback_en = 1'b1;
+                end
+                
+                `OPCODE_STORE: begin
+                    alu_result = rs1_data + imm_s;
+                    writeback_en = 1'b0; // Don't writeback for stores
+                end
+                
+                `OPCODE_SYSTEM: begin
+                    case (funct3)
+                        3'b001: begin // CSRRW
+                            if (csr_addr == `CSR_VL) begin
+                                vl_write_data = rs1_data;
+                                vl_write_en = 1'b1;
+                            end else if (csr_addr == `CSR_VTYPE) begin
+                                vtype_write_data = rs1_data;
+                                vtype_write_en = 1'b1;
+                            end
+                        end
+                    endcase
+                end
+            endcase
+        end
+    end
+    
+    // Debug outputs
+    assign debug_pc = pc;
+    assign debug_valid = fd_valid;
+    
+    // Initialize register file
+    initial begin
+        for (i = 0; i < 16; i = i + 1) begin
+            regfile[i] = 32'h0;
+        end
+    end
+
+endmodule
+
+FILE: core/vector_int_alu.v
+----------------------------------------------------------------------
+//==============================================================================
+// Vector Integer ALU
+// Supports all RVV integer operations: add, sub, shift, compare, min/max,
+// multiply, divide, carry/borrow, etc.
+//==============================================================================
+
+`include "../common/config.vh"
+`include "../common/defines.vh"
+
+module vector_int_alu #(
+    parameter VLEN = `VLEN
+)(
+    input wire clk,
+    input wire rst_n,
+    
+    // Operands
+    input wire [VLEN-1:0]  op_a,
+    input wire [VLEN-1:0]  op_b,
+    input wire [VLEN-1:0]  op_c,        // For multiply-add
+    input wire [31:0]      scalar_op,   // Scalar operand (for .vx ops)
+    input wire [4:0]       imm5,        // 5-bit immediate (for .vi ops)
+    
+    // Control
+    input wire [5:0]       funct6,
+    input wire [2:0]       sew,          // Element width
+    input wire [31:0]      vl,           // Vector length
+    input wire             use_scalar,   // Use scalar_op instead of op_b
+    input wire             use_imm,      // Use imm5 instead of op_b
+    input wire             use_carry_in, // Use carry mask
+    input wire [VLEN/8-1:0] carry_mask,  // Carry-in mask
+    
+    // Mask
+    input wire [VLEN/8-1:0] mask,
+    input wire              mask_en,
+    input wire              vma,         // Mask agnostic
+    input wire              vta,         // Tail agnostic
+    
+    // Results
+    output reg [VLEN-1:0]   result,
+    output reg [VLEN/8-1:0] mask_result, // For comparison/carry results
+    output reg              valid,
+    output reg              divide_by_zero,
+    output reg              overflow
+);
+
+    integer i;
+    reg [VLEN-1:0] temp_result;
+    reg [VLEN/8-1:0] temp_mask_result;
+    reg [VLEN-1:0] operand_b;
+    
+    // Prepare operand B (can be vector, scalar, or immediate)
+    always @(*) begin
+        if (use_imm) begin
+            // Sign-extend 5-bit immediate
+            operand_b = {{(VLEN-5){imm5[4]}}, imm5};
+        end else if (use_scalar) begin
+            // Replicate scalar across all elements based on SEW
+            case (sew)
+                `SEW_8:  operand_b = {64{scalar_op[7:0]}};
+                `SEW_16: operand_b = {32{scalar_op[15:0]}};
+                `SEW_32: operand_b = {16{scalar_op[31:0]}};
+                `SEW_64: operand_b = {8{scalar_op[31:0], 32'b0}}; // Extend to 64-bit
+                default: operand_b = op_b;
+            endcase
+        end else begin
+            operand_b = op_b;
+        end
+    end
+    
+    // Element width in bits
+    wire [6:0] elem_width = (sew == `SEW_8)  ? 7'd8  :
+                            (sew == `SEW_16) ? 7'd16 :
+                            (sew == `SEW_32) ? 7'd32 : 7'd64;
+    
+    // Number of elements
+    wire [7:0] num_elem = VLEN / elem_width;
+    
+    // ALU operation execution
+    always @(*) begin
+        temp_result = {VLEN{1'b0}};
+        temp_mask_result = {(VLEN/8){1'b0}};
+        divide_by_zero = 1'b0;
+        overflow = 1'b0;
+        valid = 1'b1;
+        
+        case (sew)
+            `SEW_8: begin
+                for (i = 0; i < 64; i = i + 1) begin
+                    if (i < vl && (!mask_en || mask[i])) begin
+                        case (funct6)
+                            // Add/Sub
+                            6'h00: temp_result[i*8 +: 8] = op_a[i*8 +: 8] + operand_b[i*8 +: 8]; // vadd
+                            6'h02: temp_result[i*8 +: 8] = op_a[i*8 +: 8] - operand_b[i*8 +: 8]; // vsub
+                            6'h03: temp_result[i*8 +: 8] = operand_b[i*8 +: 8] - op_a[i*8 +: 8]; // vrsub
+                            
+                            // Logical
+                            6'h09: temp_result[i*8 +: 8] = op_a[i*8 +: 8] & operand_b[i*8 +: 8]; // vand
+                            6'h0A: temp_result[i*8 +: 8] = op_a[i*8 +: 8] | operand_b[i*8 +: 8]; // vor
+                            6'h0B: temp_result[i*8 +: 8] = op_a[i*8 +: 8] ^ operand_b[i*8 +: 8]; // vxor
+                            
+                            // Shifts
+                            6'h25: temp_result[i*8 +: 8] = op_a[i*8 +: 8] << operand_b[i*8 +: 3]; // vsll
+                            6'h28: temp_result[i*8 +: 8] = op_a[i*8 +: 8] >> operand_b[i*8 +: 3]; // vsrl
+                            6'h29: temp_result[i*8 +: 8] = $signed(op_a[i*8 +: 8]) >>> operand_b[i*8 +: 3]; // vsra
+                            
+                            // Min/Max unsigned
+                            6'h04: temp_result[i*8 +: 8] = (op_a[i*8 +: 8] < operand_b[i*8 +: 8]) ? op_a[i*8 +: 8] : operand_b[i*8 +: 8]; // vminu
+                            6'h06: temp_result[i*8 +: 8] = (op_a[i*8 +: 8] > operand_b[i*8 +: 8]) ? op_a[i*8 +: 8] : operand_b[i*8 +: 8]; // vmaxu
+                            
+                            // Min/Max signed
+                            6'h05: temp_result[i*8 +: 8] = ($signed(op_a[i*8 +: 8]) < $signed(operand_b[i*8 +: 8])) ? op_a[i*8 +: 8] : operand_b[i*8 +: 8]; // vmin
+                            6'h07: temp_result[i*8 +: 8] = ($signed(op_a[i*8 +: 8]) > $signed(operand_b[i*8 +: 8])) ? op_a[i*8 +: 8] : operand_b[i*8 +: 8]; // vmax
+                            
+                            // Comparisons (result to mask register)
+                            6'h18: temp_mask_result[i] = (op_a[i*8 +: 8] == operand_b[i*8 +: 8]); // vmseq
+                            6'h19: temp_mask_result[i] = (op_a[i*8 +: 8] != operand_b[i*8 +: 8]); // vmsne
+                            6'h1A: temp_mask_result[i] = (op_a[i*8 +: 8] < operand_b[i*8 +: 8]);  // vmsltu
+                            6'h1B: temp_mask_result[i] = ($signed(op_a[i*8 +: 8]) < $signed(operand_b[i*8 +: 8])); // vmslt
+                            6'h1C: temp_mask_result[i] = (op_a[i*8 +: 8] <= operand_b[i*8 +: 8]); // vmsleu
+                            6'h1D: temp_mask_result[i] = ($signed(op_a[i*8 +: 8]) <= $signed(operand_b[i*8 +: 8])); // vmsle
+                            6'h1E: temp_mask_result[i] = (op_a[i*8 +: 8] > operand_b[i*8 +: 8]);  // vmsgtu
+                            6'h1F: temp_mask_result[i] = ($signed(op_a[i*8 +: 8]) > $signed(operand_b[i*8 +: 8])); // vmsgt
+                            
+                            // Multiply (low 8 bits)
+                            6'h25: temp_result[i*8 +: 8] = op_a[i*8 +: 8] * operand_b[i*8 +: 8]; // vmul
+                            
+                            // Add/subtract with carry
+                            6'h10: begin // vadc
+                                temp_result[i*8 +: 8] = op_a[i*8 +: 8] + operand_b[i*8 +: 8] + (use_carry_in ? carry_mask[i] : 1'b0);
+                            end
+                            6'h12: begin // vsbc
+                                temp_result[i*8 +: 8] = op_a[i*8 +: 8] - operand_b[i*8 +: 8] - (use_carry_in ? carry_mask[i] : 1'b0);
+                            end
+                            
+                            // Generate carry/borrow for mask register
+                            6'h11: begin // vmadc
+                                temp_mask_result[i] = (op_a[i*8 +: 8] + operand_b[i*8 +: 8] + (use_carry_in ? carry_mask[i] : 1'b0)) > 8'hFF;
+                            end
+                            6'h13: begin // vmsbc
+                                temp_mask_result[i] = (op_a[i*8 +: 8] < (operand_b[i*8 +: 8] + (use_carry_in ? carry_mask[i] : 1'b0)));
+                            end
+                            
+                            default: temp_result[i*8 +: 8] = 8'b0;
+                        endcase
+                    end else if (i >= vl && vta) begin
+                        // Tail agnostic: set tail elements to 1s
+                        temp_result[i*8 +: 8] = 8'hFF;
+                    end else if (!mask[i] && vma) begin
+                        // Mask agnostic: set masked-off elements to 1s
+                        temp_result[i*8 +: 8] = 8'hFF;
+                    end
+                end
+            end
+            
+            `SEW_16: begin
+                for (i = 0; i < 32; i = i + 1) begin
+                    if (i < vl && (!mask_en || mask[i])) begin
+                        case (funct6)
+                            6'h00: temp_result[i*16 +: 16] = op_a[i*16 +: 16] + operand_b[i*16 +: 16];
+                            6'h02: temp_result[i*16 +: 16] = op_a[i*16 +: 16] - operand_b[i*16 +: 16];
+                            6'h03: temp_result[i*16 +: 16] = operand_b[i*16 +: 16] - op_a[i*16 +: 16];
+                            6'h09: temp_result[i*16 +: 16] = op_a[i*16 +: 16] & operand_b[i*16 +: 16];
+                            6'h0A: temp_result[i*16 +: 16] = op_a[i*16 +: 16] | operand_b[i*16 +: 16];
+                            6'h0B: temp_result[i*16 +: 16] = op_a[i*16 +: 16] ^ operand_b[i*16 +: 16];
+                            6'h25: temp_result[i*16 +: 16] = op_a[i*16 +: 16] << operand_b[i*16 +: 4];
+                            6'h28: temp_result[i*16 +: 16] = op_a[i*16 +: 16] >> operand_b[i*16 +: 4];
+                            6'h29: temp_result[i*16 +: 16] = $signed(op_a[i*16 +: 16]) >>> operand_b[i*16 +: 4];
+                            6'h04: temp_result[i*16 +: 16] = (op_a[i*16 +: 16] < operand_b[i*16 +: 16]) ? op_a[i*16 +: 16] : operand_b[i*16 +: 16];
+                            6'h06: temp_result[i*16 +: 16] = (op_a[i*16 +: 16] > operand_b[i*16 +: 16]) ? op_a[i*16 +: 16] : operand_b[i*16 +: 16];
+                            6'h05: temp_result[i*16 +: 16] = ($signed(op_a[i*16 +: 16]) < $signed(operand_b[i*16 +: 16])) ? op_a[i*16 +: 16] : operand_b[i*16 +: 16];
+                            6'h07: temp_result[i*16 +: 16] = ($signed(op_a[i*16 +: 16]) > $signed(operand_b[i*16 +: 16])) ? op_a[i*16 +: 16] : operand_b[i*16 +: 16];
+                            6'h25: temp_result[i*16 +: 16] = op_a[i*16 +: 16] * operand_b[i*16 +: 16];
+                            
+                            // Comparisons
+                            6'h18: temp_mask_result[i] = (op_a[i*16 +: 16] == operand_b[i*16 +: 16]);
+                            6'h19: temp_mask_result[i] = (op_a[i*16 +: 16] != operand_b[i*16 +: 16]);
+                            6'h1A: temp_mask_result[i] = (op_a[i*16 +: 16] < operand_b[i*16 +: 16]);
+                            6'h1B: temp_mask_result[i] = ($signed(op_a[i*16 +: 16]) < $signed(operand_b[i*16 +: 16]));
+                            6'h1C: temp_mask_result[i] = (op_a[i*16 +: 16] <= operand_b[i*16 +: 16]);
+                            6'h1D: temp_mask_result[i] = ($signed(op_a[i*16 +: 16]) <= $signed(operand_b[i*16 +: 16]));
+                            
+                            default: temp_result[i*16 +: 16] = 16'b0;
+                        endcase
+                    end else if (i >= vl && vta) begin
+                        temp_result[i*16 +: 16] = 16'hFFFF;
+                    end else if (!mask[i] && vma) begin
+                        temp_result[i*16 +: 16] = 16'hFFFF;
+                    end
+                end
+            end
+            
+            `SEW_32: begin
+                for (i = 0; i < 16; i = i + 1) begin
+                    if (i < vl && (!mask_en || mask[i])) begin
+                        case (funct6)
+                            6'h00: temp_result[i*32 +: 32] = op_a[i*32 +: 32] + operand_b[i*32 +: 32];
+                            6'h02: temp_result[i*32 +: 32] = op_a[i*32 +: 32] - operand_b[i*32 +: 32];
+                            6'h03: temp_result[i*32 +: 32] = operand_b[i*32 +: 32] - op_a[i*32 +: 32];
+                            6'h09: temp_result[i*32 +: 32] = op_a[i*32 +: 32] & operand_b[i*32 +: 32];
+                            6'h0A: temp_result[i*32 +: 32] = op_a[i*32 +: 32] | operand_b[i*32 +: 32];
+                            6'h0B: temp_result[i*32 +: 32] = op_a[i*32 +: 32] ^ operand_b[i*32 +: 32];
+                            6'h25: temp_result[i*32 +: 32] = op_a[i*32 +: 32] << operand_b[i*32 +: 5];
+                            6'h28: temp_result[i*32 +: 32] = op_a[i*32 +: 32] >> operand_b[i*32 +: 5];
+                            6'h29: temp_result[i*32 +: 32] = $signed(op_a[i*32 +: 32]) >>> operand_b[i*32 +: 5];
+                            6'h04: temp_result[i*32 +: 32] = (op_a[i*32 +: 32] < operand_b[i*32 +: 32]) ? op_a[i*32 +: 32] : operand_b[i*32 +: 32];
+                            6'h06: temp_result[i*32 +: 32] = (op_a[i*32 +: 32] > operand_b[i*32 +: 32]) ? op_a[i*32 +: 32] : operand_b[i*32 +: 32];
+                            6'h05: temp_result[i*32 +: 32] = ($signed(op_a[i*32 +: 32]) < $signed(operand_b[i*32 +: 32])) ? op_a[i*32 +: 32] : operand_b[i*32 +: 32];
+                            6'h07: temp_result[i*32 +: 32] = ($signed(op_a[i*32 +: 32]) > $signed(operand_b[i*32 +: 32])) ? op_a[i*32 +: 32] : operand_b[i*32 +: 32];
+                            6'h25: temp_result[i*32 +: 32] = op_a[i*32 +: 32] * operand_b[i*32 +: 32];
+                            6'h20: begin // vdivu
+                                if (operand_b[i*32 +: 32] == 32'b0) begin
+                                    temp_result[i*32 +: 32] = 32'hFFFFFFFF;
+                                    divide_by_zero = 1'b1;
+                                end else begin
+                                    temp_result[i*32 +: 32] = op_a[i*32 +: 32] / operand_b[i*32 +: 32];
+                                end
+                            end
+                            6'h21: begin // vdiv
+                                if (operand_b[i*32 +: 32] == 32'b0) begin
+                                    temp_result[i*32 +: 32] = 32'hFFFFFFFF;
+                                    divide_by_zero = 1'b1;
+                                end else begin
+                                    temp_result[i*32 +: 32] = $signed(op_a[i*32 +: 32]) / $signed(operand_b[i*32 +: 32]);
+                                end
+                            end
+                            6'h22: begin // vremu
+                                if (operand_b[i*32 +: 32] == 32'b0) begin
+                                    temp_result[i*32 +: 32] = op_a[i*32 +: 32];
+                                end else begin
+                                    temp_result[i*32 +: 32] = op_a[i*32 +: 32] % operand_b[i*32 +: 32];
+                                end
+                            end
+                            6'h23: begin // vrem
+                                if (operand_b[i*32 +: 32] == 32'b0) begin
+                                    temp_result[i*32 +: 32] = op_a[i*32 +: 32];
+                                end else begin
+                                    temp_result[i*32 +: 32] = $signed(op_a[i*32 +: 32]) % $signed(operand_b[i*32 +: 32]);
+                                end
+                            end
+                            6'h2D: temp_result[i*32 +: 32] = op_c[i*32 +: 32] + (op_a[i*32 +: 32] * operand_b[i*32 +: 32]); // vmacc
+                            
+                            // Comparisons
+                            6'h18: temp_mask_result[i] = (op_a[i*32 +: 32] == operand_b[i*32 +: 32]);
+                            6'h19: temp_mask_result[i] = (op_a[i*32 +: 32] != operand_b[i*32 +: 32]);
+                            6'h1A: temp_mask_result[i] = (op_a[i*32 +: 32] < operand_b[i*32 +: 32]);
+                            6'h1B: temp_mask_result[i] = ($signed(op_a[i*32 +: 32]) < $signed(operand_b[i*32 +: 32]));
+                            
+                            default: temp_result[i*32 +: 32] = 32'b0;
+                        endcase
+                    end else if (i >= vl && vta) begin
+                        temp_result[i*32 +: 32] = 32'hFFFFFFFF;
+                    end else if (!mask[i] && vma) begin
+                        temp_result[i*32 +: 32] = 32'hFFFFFFFF;
+                    end
+                end
+            end
+            
+            `SEW_64: begin
+                for (i = 0; i < 8; i = i + 1) begin
+                    if (i < vl && (!mask_en || mask[i])) begin
+                        case (funct6)
+                            6'h00: temp_result[i*64 +: 64] = op_a[i*64 +: 64] + operand_b[i*64 +: 64];
+                            6'h02: temp_result[i*64 +: 64] = op_a[i*64 +: 64] - operand_b[i*64 +: 64];
+                            6'h09: temp_result[i*64 +: 64] = op_a[i*64 +: 64] & operand_b[i*64 +: 64];
+                            6'h0A: temp_result[i*64 +: 64] = op_a[i*64 +: 64] | operand_b[i*64 +: 64];
+                            6'h0B: temp_result[i*64 +: 64] = op_a[i*64 +: 64] ^ operand_b[i*64 +: 64];
+                            6'h25: temp_result[i*64 +: 64] = op_a[i*64 +: 64] << operand_b[i*64 +: 6];
+                            6'h28: temp_result[i*64 +: 64] = op_a[i*64 +: 64] >> operand_b[i*64 +: 6];
+                            6'h29: temp_result[i*64 +: 64] = $signed(op_a[i*64 +: 64]) >>> operand_b[i*64 +: 6];
+                            6'h04: temp_result[i*64 +: 64] = (op_a[i*64 +: 64] < operand_b[i*64 +: 64]) ? op_a[i*64 +: 64] : operand_b[i*64 +: 64];
+                            6'h06: temp_result[i*64 +: 64] = (op_a[i*64 +: 64] > operand_b[i*64 +: 64]) ? op_a[i*64 +: 64] : operand_b[i*64 +: 64];
+                            6'h18: temp_mask_result[i] = (op_a[i*64 +: 64] == operand_b[i*64 +: 64]);
+                            6'h19: temp_mask_result[i] = (op_a[i*64 +: 64] != operand_b[i*64 +: 64]);
+                            default: temp_result[i*64 +: 64] = 64'b0;
+                        endcase
+                    end else if (i >= vl && vta) begin
+                        temp_result[i*64 +: 64] = 64'hFFFFFFFFFFFFFFFF;
+                    end else if (!mask[i] && vma) begin
+                        temp_result[i*64 +: 64] = 64'hFFFFFFFFFFFFFFFF;
+                    end
+                end
+            end
+        endcase
+    end
+    
+    // Register output
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            result <= {VLEN{1'b0}};
+            mask_result <= {(VLEN/8){1'b0}};
+        end else begin
+            result <= temp_result;
+            mask_result <= temp_mask_result;
+        end
+    end
+
+endmodule
+
+FILE: core/vector_decoder.v
+----------------------------------------------------------------------
+//==============================================================================
+// Vector Instruction Decoder
+// Decodes RVV 1.0 instructions and generates control signals
+// Supports all instruction formats: OPIVV, OPFVV, OPMVV, OPIVX, OPFVF, OPMVX,
+// OPIVI, OPMVI, OPCFG, LOAD-FP, STORE-FP
+//==============================================================================
+
+`include "../common/config.vh"
+`include "../common/defines.vh"
+
+module vector_decoder (
+    input wire [31:0] inst,
+    input wire        valid,
+    
+    // Decoded outputs
+    output reg        is_vector_inst,
+    output reg        is_vector_arith,
+    output reg        is_vector_load,
+    output reg        is_vector_store,
+    output reg        is_vector_config,
+    output reg        is_vector_mask_op,
+    output reg        is_vector_reduction,
+    output reg        is_vector_permute,
+    output reg        is_widening,
+    output reg        is_narrowing,
+    output reg        is_fp_op,
+    
+    // Operand addresses
+    output reg [4:0]  vd,
+    output reg [4:0]  vs1,
+    output reg [4:0]  vs2,
+    output reg [4:0]  rs1,
+    output reg [4:0]  rs2,
+    
+    // Operation encoding
+    output reg [5:0]  funct6,
+    output reg [5:0]  valu_op,
+    output reg [2:0]  width,
+    output reg [2:0]  mop,
+    output reg [2:0]  nf,
+    output reg        vm,
+    output reg [10:0] zimm,
+    output reg [4:0]  imm5,
+    
+    // Load/store specific
+    output reg [1:0]  lumop,
+    output reg [1:0]  sumop,
+    output reg        whole_reg,
+    output reg        unit_stride,
+    output reg        strided,
+    output reg        indexed,
+    output reg        segment,
+    output reg        fault_only_first
+);
+
+    wire [6:0] opcode = inst[6:0];
+    wire [2:0] funct3 = inst[14:12];
+    wire [5:0] funct6_field = inst[31:26];
+    wire       funct1 = inst[25];
+    wire [4:0] zimm11 = inst[19:15];
+    
+    always @(*) begin
+        // Defaults
+        is_vector_inst = 1'b0;
+        is_vector_arith = 1'b0;
+        is_vector_load = 1'b0;
+        is_vector_store = 1'b0;
+        is_vector_config = 1'b0;
+        is_vector_mask_op = 1'b0;
+        is_vector_reduction = 1'b0;
+        is_vector_permute = 1'b0;
+        is_widening = 1'b0;
+        is_narrowing = 1'b0;
+        is_fp_op = 1'b0;
+        
+        vd = inst[11:7];
+        vs1 = inst[19:15];
+        vs2 = inst[24:20];
+        rs1 = inst[19:15];
+        rs2 = inst[24:20];
+        
+        funct6 = funct6_field;
+        valu_op = funct6_field;
+        width = funct3;
+        mop = inst[27:26];
+        nf = inst[31:29];
+        vm = inst[25];
+        zimm = inst[30:20];
+        imm5 = inst[19:15];
+        
+        lumop = inst[24:20];
+        sumop = inst[24:20];
+        whole_reg = 1'b0;
+        unit_stride = 1'b0;
+        strided = 1'b0;
+        indexed = 1'b0;
+        segment = 1'b0;
+        fault_only_first = 1'b0;
+        
+        if (valid && opcode == `OPCODE_VECTOR) begin
+            is_vector_inst = 1'b1;
+            
+            case (funct3)
+                //--------------------------------------------------------------
+                // Vector-Vector Arithmetic (OPIVV, OPMVV, OPFVV)
+                //--------------------------------------------------------------
+                3'b000: begin // OPIVV
+                    is_vector_arith = 1'b1;
+                    case (funct6_field)
+                        6'h00: valu_op = 6'h00; // vadd.vv
+                        6'h02: valu_op = 6'h02; // vsub.vv
+                        6'h04: valu_op = 6'h04; // vminu.vv
+                        6'h05: valu_op = 6'h05; // vmin.vv
+                        6'h06: valu_op = 6'h06; // vmaxu.vv
+                        6'h07: valu_op = 6'h07; // vmax.vv
+                        6'h09: valu_op = 6'h09; // vand.vv
+                        6'h0A: valu_op = 6'h0A; // vor.vv
+                        6'h0B: valu_op = 6'h0B; // vxor.vv
+                        6'h0C: valu_op = 6'h0C; // vrgather.vv
+                        6'h0E: begin // vrgatherei16.vv
+                            valu_op = 6'h0E;
+                            is_vector_permute = 1'b1;
+                        end
+                        6'h10: begin // vadc.vvm
+                            valu_op = 6'h10;
+                            vm = 1'b0; // Always unmasked for carry ops
+                        end
+                        6'h11: valu_op = 6'h11; // vmadc.vvm
+                        6'h12: valu_op = 6'h12; // vsbc.vvm
+                        6'h13: valu_op = 6'h13; // vmsbc.vvm
+                        6'h17: begin // vmerge.vvm / vmv.v.v
+                            valu_op = 6'h17;
+                            is_vector_permute = (vs2 == 5'b0); // vmv.v.v when vs2=0
+                        end
+                        6'h18: valu_op = 6'h18; // vmseq.vv
+                        6'h19: valu_op = 6'h19; // vmsne.vv
+                        6'h1A: valu_op = 6'h1A; // vmsltu.vv
+                        6'h1B: valu_op = 6'h1B; // vmslt.vv
+                        6'h1C: valu_op = 6'h1C; // vmsleu.vv
+                        6'h1D: valu_op = 6'h1D; // vmsle.vv
+                        6'h1E: valu_op = 6'h1E; // vmsgt.vv (pseudo)
+                        6'h1F: valu_op = 6'h1F; // vmsgtu.vv (pseudo)
+                        6'h20: valu_op = 6'h20; // vsaddu.vv
+                        6'h21: valu_op = 6'h21; // vsadd.vv
+                        6'h22: valu_op = 6'h22; // vssubu.vv
+                        6'h23: valu_op = 6'h23; // vssub.vv
+                        6'h25: valu_op = 6'h25; // vsll.vv
+                        6'h26: valu_op = 6'h26; // vsmul.vv
+                        6'h27: valu_op = 6'h27; // vmv<nr>r.v (whole register move)
+                        6'h28: valu_op = 6'h28; // vsrl.vv
+                        6'h29: valu_op = 6'h29; // vsra.vv
+                        6'h2A: valu_op = 6'h2A; // vssrl.vv
+                        6'h2B: valu_op = 6'h2B; // vssra.vv
+                        6'h2C: valu_op = 6'h2C; // vnsrl.wv (narrowing)
+                        6'h2D: valu_op = 6'h2D; // vnsra.wv (narrowing)
+                        6'h2E: valu_op = 6'h2E; // vnclipu.wv (narrowing clip)
+                        6'h2F: valu_op = 6'h2F; // vnclip.wv (narrowing clip)
+                        default: valu_op = 6'h00;
+                    endcase
+                    
+                    // Detect widening operations (wv suffix)
+                    if (funct6_field[5:4] == 2'b11) begin
+                        is_widening = (funct6_field[3:0] >= 4'h0 && funct6_field[3:0] <= 4'h7);
+                    end
+                    
+                    // Detect narrowing operations (w prefix in name)
+                    if (funct6_field >= 6'h2C && funct6_field <= 6'h2F) begin
+                        is_narrowing = 1'b1;
+                    end
+                end
+                
+                3'b001: begin // OPFVV - Floating-point vector-vector
+                    is_vector_arith = 1'b1;
+                    is_fp_op = 1'b1;
+                    case (funct6_field)
+                        6'h00: valu_op = 6'h00; // vfadd.vv
+                        6'h01: begin // vfredusum.vs
+                            valu_op = 6'h01;
+                            is_vector_reduction = 1'b1;
+                        end
+                        6'h02: valu_op = 6'h02; // vfsub.vv
+                        6'h03: begin // vfredosum.vs
+                            valu_op = 6'h03;
+                            is_vector_reduction = 1'b1;
+                        end
+                        6'h04: valu_op = 6'h04; // vfmin.vv
+                        6'h05: begin // vfredmin.vs
+                            valu_op = 6'h05;
+                            is_vector_reduction = 1'b1;
+                        end
+                        6'h06: valu_op = 6'h06; // vfmax.vv
+                        6'h07: begin // vfredmax.vs
+                            valu_op = 6'h07;
+                            is_vector_reduction = 1'b1;
+                        end
+                        6'h08: valu_op = 6'h08; // vfsgnj.vv
+                        6'h09: valu_op = 6'h09; // vfsgnjn.vv
+                        6'h0A: valu_op = 6'h0A; // vfsgnjx.vv
+                        6'h10: valu_op = 6'h10; // vfmv.f.s (vector-scalar move)
+                        6'h18: valu_op = 6'h18; // vmfeq.vv
+                        6'h19: valu_op = 6'h19; // vmfle.vv
+                        6'h1B: valu_op = 6'h1B; // vmflt.vv
+                        6'h1C: valu_op = 6'h1C; // vmfne.vv
+                        6'h1D: valu_op = 6'h1D; // vmfgt.vv (pseudo)
+                        6'h1F: valu_op = 6'h1F; // vmfge.vv (pseudo)
+                        6'h20: valu_op = 6'h20; // vfdiv.vv
+                        6'h24: valu_op = 6'h24; // vfmul.vv
+                        6'h27: valu_op = 6'h27; // vfmerge.vfm
+                        6'h28: begin // vfmadd.vv
+                            valu_op = 6'h28;
+                        end
+                        6'h29: valu_op = 6'h29; // vfnmadd.vv
+                        6'h2A: valu_op = 6'h2A; // vfmsub.vv
+                        6'h2B: valu_op = 6'h2B; // vfnmsub.vv
+                        6'h2C: valu_op = 6'h2C; // vfmacc.vv
+                        6'h2D: valu_op = 6'h2D; // vfnmacc.vv
+                        6'h2E: valu_op = 6'h2E; // vfmsac.vv
+                        6'h2F: valu_op = 6'h2F; // vfnmsac.vv
+                        6'h30: valu_op = 6'h30; // vfwadd.vv (widening)
+                        6'h31: begin // vfwredusum.vs
+                            valu_op = 6'h31;
+                            is_vector_reduction = 1'b1;
+                            is_widening = 1'b1;
+                        end
+                        6'h32: valu_op = 6'h32; // vfwsub.vv (widening)
+                        6'h33: begin // vfwredosum.vs
+                            valu_op = 6'h33;
+                            is_vector_reduction = 1'b1;
+                            is_widening = 1'b1;
+                        end
+                        6'h34: valu_op = 6'h34; // vfwadd.wv (widening)
+                        6'h36: valu_op = 6'h36; // vfwsub.wv (widening)
+                        6'h38: valu_op = 6'h38; // vfwmul.vv (widening)
+                        6'h3C: valu_op = 6'h3C; // vfwmacc.vv (widening)
+                        6'h3D: valu_op = 6'h3D; // vfwnmacc.vv (widening)
+                        6'h3E: valu_op = 6'h3E; // vfwmsac.vv (widening)
+                        6'h3F: valu_op = 6'h3F; // vfwnmsac.vv (widening)
+                        default: valu_op = 6'h00;
+                    endcase
+                    
+                    // Widening FP operations
+                    if (funct6_field >= 6'h30 && funct6_field <= 6'h3F) begin
+                        is_widening = 1'b1;
+                    end
+                end
+                
+                3'b010: begin // OPMVV - Mask/integer ops
+                    case (funct6_field)
+                        6'h00: begin // vredsum.vs
+                            is_vector_reduction = 1'b1;
+                            valu_op = 6'h00;
+                        end
+                        6'h01: begin // vredand.vs
+                            is_vector_reduction = 1'b1;
+                            valu_op = 6'h01;
+                        end
+                        6'h02: begin // vredor.vs
+                            is_vector_reduction = 1'b1;
+                            valu_op = 6'h02;
+                        end
+                        6'h03: begin // vredxor.vs
+                            is_vector_reduction = 1'b1;
+                            valu_op = 6'h03;
+                        end
+                        6'h04: begin // vredminu.vs
+                            is_vector_reduction = 1'b1;
+                            valu_op = 6'h04;
+                        end
+                        6'h05: begin // vredmin.vs
+                            is_vector_reduction = 1'b1;
+                            valu_op = 6'h05;
+                        end
+                        6'h06: begin // vredmaxu.vs
+                            is_vector_reduction = 1'b1;
+                            valu_op = 6'h06;
+                        end
+                        6'h07: begin // vredmax.vs
+                            is_vector_reduction = 1'b1;
+                            valu_op = 6'h07;
+                        end
+                        6'h08: begin // vaaddu.vv
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h08;
+                        end
+                        6'h09: begin // vaadd.vv
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h09;
+                        end
+                        6'h0A: begin // vasubu.vv
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h0A;
+                        end
+                        6'h0B: begin // vasub.vv
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h0B;
+                        end
+                        6'h10: begin // vwxunary0 - Contains vmv.x.s, vcpop.m, vfirst.m
+                            is_vector_mask_op = (vs2[4:3] == 2'b10);
+                            is_vector_permute = (vs2 == 5'b00000); // vmv.x.s
+                            valu_op = {1'b0, vs2};
+                        end
+                        6'h11: begin // vrxunary0 - Contains vmv.s.x
+                            is_vector_permute = 1'b1;
+                            valu_op = 6'h11;
+                        end
+                        6'h12: begin // vmunary0 - Contains mask ops (vmsbf, vmsif, vmsof, viota, vid)
+                            is_vector_mask_op = 1'b1;
+                            valu_op = {1'b0, vs1};
+                        end
+                        6'h14: begin // vmunary0 - vpopc, vid, etc
+                            is_vector_mask_op = 1'b1;
+                            valu_op = {1'b0, vs1};
+                        end
+                        6'h17: begin // vcompress.vm
+                            is_vector_permute = 1'b1;
+                            valu_op = 6'h17;
+                        end
+                        6'h18: begin // vmandnot.mm
+                            is_vector_mask_op = 1'b1;
+                            valu_op = 6'h18;
+                        end
+                        6'h19: begin // vmand.mm
+                            is_vector_mask_op = 1'b1;
+                            valu_op = 6'h19;
+                        end
+                        6'h1A: begin // vmor.mm
+                            is_vector_mask_op = 1'b1;
+                            valu_op = 6'h1A;
+                        end
+                        6'h1B: begin // vmxor.mm
+                            is_vector_mask_op = 1'b1;
+                            valu_op = 6'h1B;
+                        end
+                        6'h1C: begin // vmornot.mm
+                            is_vector_mask_op = 1'b1;
+                            valu_op = 6'h1C;
+                        end
+                        6'h1D: begin // vmnand.mm
+                            is_vector_mask_op = 1'b1;
+                            valu_op = 6'h1D;
+                        end
+                        6'h1E: begin // vmnor.mm
+                            is_vector_mask_op = 1'b1;
+                            valu_op = 6'h1E;
+                        end
+                        6'h1F: begin // vmxnor.mm
+                            is_vector_mask_op = 1'b1;
+                            valu_op = 6'h1F;
+                        end
+                        6'h20: begin // vdivu.vv
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h20;
+                        end
+                        6'h21: begin // vdiv.vv
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h21;
+                        end
+                        6'h22: begin // vremu.vv
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h22;
+                        end
+                        6'h23: begin // vrem.vv
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h23;
+                        end
+                        6'h24: begin // vmulhu.vv
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h24;
+                        end
+                        6'h25: begin // vmul.vv
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h25;
+                        end
+                        6'h26: begin // vmulhsu.vv
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h26;
+                        end
+                        6'h27: begin // vmulh.vv
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h27;
+                        end
+                        6'h29: begin // vmadd.vv
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h29;
+                        end
+                        6'h2B: begin // vnmsub.vv
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h2B;
+                        end
+                        6'h2D: begin // vmacc.vv
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h2D;
+                        end
+                        6'h2F: begin // vnmsac.vv
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h2F;
+                        end
+                        6'h30: begin // vwaddu.vv (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h30;
+                        end
+                        6'h31: begin // vwadd.vv (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h31;
+                        end
+                        6'h32: begin // vwsubu.vv (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h32;
+                        end
+                        6'h33: begin // vwsub.vv (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h33;
+                        end
+                        6'h34: begin // vwaddu.wv (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h34;
+                        end
+                        6'h35: begin // vwadd.wv (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h35;
+                        end
+                        6'h36: begin // vwsubu.wv (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h36;
+                        end
+                        6'h37: begin // vwsub.wv (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h37;
+                        end
+                        6'h38: begin // vwmulu.vv (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h38;
+                        end
+                        6'h3A: begin // vwmulsu.vv (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h3A;
+                        end
+                        6'h3B: begin // vwmul.vv (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h3B;
+                        end
+                        6'h3C: begin // vwmaccu.vv (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h3C;
+                        end
+                        6'h3D: begin // vwmacc.vv (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h3D;
+                        end
+                        6'h3F: begin // vwmaccsu.vv (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h3F;
+                        end
+                        default: valu_op = 6'h00;
+                    endcase
+                end
+                
+                //--------------------------------------------------------------
+                // Vector-Scalar and Vector-Immediate ops
+                //--------------------------------------------------------------
+                3'b011: begin // OPIVI - Vector-immediate
+                    is_vector_arith = 1'b1;
+                    case (funct6_field)
+                        6'h00: valu_op = 6'h00; // vadd.vi
+                        6'h02: valu_op = 6'h02; // vrsub.vi
+                        6'h03: valu_op = 6'h03; // vnot (pseudo)
+                        6'h09: valu_op = 6'h09; // vand.vi
+                        6'h0A: valu_op = 6'h0A; // vor.vi
+                        6'h0B: valu_op = 6'h0B; // vxor.vi
+                        6'h0C: begin // vrgather.vi
+                            valu_op = 6'h0C;
+                            is_vector_permute = 1'b1;
+                        end
+                        6'h0E: begin // vslideup.vi
+                            valu_op = 6'h0E;
+                            is_vector_permute = 1'b1;
+                        end
+                        6'h0F: begin // vslidedown.vi
+                            valu_op = 6'h0F;
+                            is_vector_permute = 1'b1;
+                        end
+                        6'h10: valu_op = 6'h10; // vadc.vim
+                        6'h11: valu_op = 6'h11; // vmadc.vim
+                        6'h17: begin // vmerge.vim / vmv.v.i
+                            valu_op = 6'h17;
+                            is_vector_permute = (vm == 1'b1); // vmv.v.i when unmasked
+                        end
+                        6'h18: valu_op = 6'h18; // vmseq.vi
+                        6'h19: valu_op = 6'h19; // vmsne.vi
+                        6'h1A: valu_op = 6'h1A; // vmsleu.vi
+                        6'h1B: valu_op = 6'h1B; // vmsle.vi
+                        6'h1E: valu_op = 6'h1E; // vmsgtu.vi
+                        6'h1F: valu_op = 6'h1F; // vmsgt.vi
+                        6'h20: valu_op = 6'h20; // vsaddu.vi
+                        6'h21: valu_op = 6'h21; // vsadd.vi
+                        6'h25: valu_op = 6'h25; // vsll.vi
+                        6'h27: begin // vmv1r.v, vmv2r.v, etc (whole reg move)
+                            valu_op = 6'h27;
+                            is_vector_permute = 1'b1;
+                            whole_reg = 1'b1;
+                        end
+                        6'h28: valu_op = 6'h28; // vsrl.vi
+                        6'h29: valu_op = 6'h29; // vsra.vi
+                        6'h2A: valu_op = 6'h2A; // vssrl.vi
+                        6'h2B: valu_op = 6'h2B; // vssra.vi
+                        6'h2C: begin // vnsrl.wi (narrowing)
+                            valu_op = 6'h2C;
+                            is_narrowing = 1'b1;
+                        end
+                        6'h2D: begin // vnsra.wi (narrowing)
+                            valu_op = 6'h2D;
+                            is_narrowing = 1'b1;
+                        end
+                        6'h2E: begin // vnclipu.wi (narrowing)
+                            valu_op = 6'h2E;
+                            is_narrowing = 1'b1;
+                        end
+                        6'h2F: begin // vnclip.wi (narrowing)
+                            valu_op = 6'h2F;
+                            is_narrowing = 1'b1;
+                        end
+                        default: valu_op = 6'h00;
+                    endcase
+                end
+                
+                3'b100: begin // OPIVX - Vector-scalar
+                    is_vector_arith = 1'b1;
+                    case (funct6_field)
+                        6'h00: valu_op = 6'h00; // vadd.vx
+                        6'h02: valu_op = 6'h02; // vsub.vx
+                        6'h04: valu_op = 6'h04; // vminu.vx
+                        6'h05: valu_op = 6'h05; // vmin.vx
+                        6'h06: valu_op = 6'h06; // vmaxu.vx
+                        6'h07: valu_op = 6'h07; // vmax.vx
+                        6'h09: valu_op = 6'h09; // vand.vx
+                        6'h0A: valu_op = 6'h0A; // vor.vx
+                        6'h0B: valu_op = 6'h0B; // vxor.vx
+                        6'h0C: begin // vrgather.vx
+                            valu_op = 6'h0C;
+                            is_vector_permute = 1'b1;
+                        end
+                        6'h0E: begin // vslideup.vx
+                            valu_op = 6'h0E;
+                            is_vector_permute = 1'b1;
+                        end
+                        6'h0F: begin // vslidedown.vx
+                            valu_op = 6'h0F;
+                            is_vector_permute = 1'b1;
+                        end
+                        6'h10: valu_op = 6'h10; // vadc.vxm
+                        6'h11: valu_op = 6'h11; // vmadc.vxm
+                        6'h12: valu_op = 6'h12; // vsbc.vxm
+                        6'h13: valu_op = 6'h13; // vmsbc.vxm
+                        6'h17: begin // vmerge.vxm / vmv.v.x
+                            valu_op = 6'h17;
+                            is_vector_permute = (vm == 1'b1);
+                        end
+                        6'h18: valu_op = 6'h18; // vmseq.vx
+                        6'h19: valu_op = 6'h19; // vmsne.vx
+                        6'h1A: valu_op = 6'h1A; // vmsltu.vx
+                        6'h1B: valu_op = 6'h1B; // vmslt.vx
+                        6'h1C: valu_op = 6'h1C; // vmsleu.vx
+                        6'h1D: valu_op = 6'h1D; // vmsle.vx
+                        6'h1E: valu_op = 6'h1E; // vmsgtu.vx
+                        6'h1F: valu_op = 6'h1F; // vmsgt.vx
+                        6'h20: valu_op = 6'h20; // vsaddu.vx
+                        6'h21: valu_op = 6'h21; // vsadd.vx
+                        6'h22: valu_op = 6'h22; // vssubu.vx
+                        6'h23: valu_op = 6'h23; // vssub.vx
+                        6'h25: valu_op = 6'h25; // vsll.vx
+                        6'h26: valu_op = 6'h26; // vsmul.vx
+                        6'h27: begin // vslide1up.vx
+                            valu_op = 6'h27;
+                            is_vector_permute = 1'b1;
+                        end
+                        6'h28: valu_op = 6'h28; // vsrl.vx
+                        6'h29: valu_op = 6'h29; // vsra.vx
+                        6'h2A: valu_op = 6'h2A; // vssrl.vx
+                        6'h2B: valu_op = 6'h2B; // vssra.vx
+                        6'h2C: begin // vnsrl.wx (narrowing)
+                            valu_op = 6'h2C;
+                            is_narrowing = 1'b1;
+                        end
+                        6'h2D: begin // vnsra.wx (narrowing)
+                            valu_op = 6'h2D;
+                            is_narrowing = 1'b1;
+                        end
+                        6'h2E: begin // vnclipu.wx (narrowing)
+                            valu_op = 6'h2E;
+                            is_narrowing = 1'b1;
+                        end
+                        6'h2F: begin // vnclip.wx (narrowing)
+                            valu_op = 6'h2F;
+                            is_narrowing = 1'b1;
+                        end
+                        6'h39: begin // vslide1down.vx
+                            valu_op = 6'h39;
+                            is_vector_permute = 1'b1;
+                        end
+                        default: valu_op = 6'h00;
+                    endcase
+                end
+                
+                3'b101: begin // OPFVF - Floating-point vector-scalar
+                    is_vector_arith = 1'b1;
+                    is_fp_op = 1'b1;
+                    case (funct6_field)
+                        6'h00: valu_op = 6'h00; // vfadd.vf
+                        6'h02: valu_op = 6'h02; // vfsub.vf
+                        6'h04: valu_op = 6'h04; // vfmin.vf
+                        6'h06: valu_op = 6'h06; // vfmax.vf
+                        6'h08: valu_op = 6'h08; // vfsgnj.vf
+                        6'h09: valu_op = 6'h09; // vfsgnjn.vf
+                        6'h0A: valu_op = 6'h0A; // vfsgnjx.vf
+                        6'h0E: begin // vfslide1up.vf
+                            valu_op = 6'h0E;
+                            is_vector_permute = 1'b1;
+                        end
+                        6'h0F: begin // vfslide1down.vf
+                            valu_op = 6'h0F;
+                            is_vector_permute = 1'b1;
+                        end
+                        6'h10: valu_op = 6'h10; // vfmv.s.f
+                        6'h17: begin // vfmerge.vfm
+                            valu_op = 6'h17;
+                        end
+                        6'h18: valu_op = 6'h18; // vmfeq.vf
+                        6'h19: valu_op = 6'h19; // vmfle.vf
+                        6'h1B: valu_op = 6'h1B; // vmflt.vf
+                        6'h1C: valu_op = 6'h1C; // vmfne.vf
+                        6'h1D: valu_op = 6'h1D; // vmfgt.vf
+                        6'h1F: valu_op = 6'h1F; // vmfge.vf
+                        6'h20: valu_op = 6'h20; // vfdiv.vf
+                        6'h21: valu_op = 6'h21; // vfrdiv.vf
+                        6'h24: valu_op = 6'h24; // vfmul.vf
+                        6'h27: valu_op = 6'h27; // vfrsub.vf
+                        6'h28: valu_op = 6'h28; // vfmadd.vf
+                        6'h29: valu_op = 6'h29; // vfnmadd.vf
+                        6'h2A: valu_op = 6'h2A; // vfmsub.vf
+                        6'h2B: valu_op = 6'h2B; // vfnmsub.vf
+                        6'h2C: valu_op = 6'h2C; // vfmacc.vf
+                        6'h2D: valu_op = 6'h2D; // vfnmacc.vf
+                        6'h2E: valu_op = 6'h2E; // vfmsac.vf
+                        6'h2F: valu_op = 6'h2F; // vfnmsac.vf
+                        6'h30: begin // vfwadd.vf (widening)
+                            valu_op = 6'h30;
+                            is_widening = 1'b1;
+                        end
+                        6'h32: begin // vfwsub.vf (widening)
+                            valu_op = 6'h32;
+                            is_widening = 1'b1;
+                        end
+                        6'h34: begin // vfwadd.wf (widening)
+                            valu_op = 6'h34;
+                            is_widening = 1'b1;
+                        end
+                        6'h36: begin // vfwsub.wf (widening)
+                            valu_op = 6'h36;
+                            is_widening = 1'b1;
+                        end
+                        6'h38: begin // vfwmul.vf (widening)
+                            valu_op = 6'h38;
+                            is_widening = 1'b1;
+                        end
+                        6'h3C: begin // vfwmacc.vf (widening)
+                            valu_op = 6'h3C;
+                            is_widening = 1'b1;
+                        end
+                        6'h3D: begin // vfwnmacc.vf (widening)
+                            valu_op = 6'h3D;
+                            is_widening = 1'b1;
+                        end
+                        6'h3E: begin // vfwmsac.vf (widening)
+                            valu_op = 6'h3E;
+                            is_widening = 1'b1;
+                        end
+                        6'h3F: begin // vfwnmsac.vf (widening)
+                            valu_op = 6'h3F;
+                            is_widening = 1'b1;
+                        end
+                        default: valu_op = 6'h00;
+                    endcase
+                end
+                
+                3'b110: begin // OPMVX - Integer vector-scalar
+                    case (funct6_field)
+                        6'h08: begin // vaaddu.vx
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h08;
+                        end
+                        6'h09: begin // vaadd.vx
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h09;
+                        end
+                        6'h0A: begin // vasubu.vx
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h0A;
+                        end
+                        6'h0B: begin // vasub.vx
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h0B;
+                        end
+                        6'h0E: begin // vslide1up.vx
+                            is_vector_permute = 1'b1;
+                            valu_op = 6'h0E;
+                        end
+                        6'h0F: begin // vslide1down.vx
+                            is_vector_permute = 1'b1;
+                            valu_op = 6'h0F;
+                        end
+                        6'h10: begin // vwxunary0 (FP conversions, class, etc)
+                            is_fp_op = 1'b1;
+                            valu_op = {1'b0, vs2};
+                        end
+                        6'h11: begin // vrxunary0 (FP conversions)
+                            is_fp_op = 1'b1;
+                            valu_op = {1'b0, vs2};
+                        end
+                        6'h12: begin // vwfunary0 (FP sqrt, rsqrt, rcp, class)
+                            is_fp_op = 1'b1;
+                            valu_op = {1'b0, vs1};
+                        end
+                        6'h13: begin // vrfunary0 (FP conversions)
+                            is_fp_op = 1'b1;
+                            valu_op = {1'b0, vs1};
+                        end
+                        6'h14: begin // vwfunary1 (more FP unary ops)
+                            is_fp_op = 1'b1;
+                            valu_op = {1'b0, vs1};
+                        end
+                        6'h18: begin // vwfunary0 extension
+                            is_fp_op = 1'b1;
+                            valu_op = {1'b0, vs1};
+                        end
+                        6'h20: begin // vdivu.vx
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h20;
+                        end
+                        6'h21: begin // vdiv.vx
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h21;
+                        end
+                        6'h22: begin // vremu.vx
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h22;
+                        end
+                        6'h23: begin // vrem.vx
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h23;
+                        end
+                        6'h24: begin // vmulhu.vx
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h24;
+                        end
+                        6'h25: begin // vmul.vx
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h25;
+                        end
+                        6'h26: begin // vmulhsu.vx
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h26;
+                        end
+                        6'h27: begin // vmulh.vx
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h27;
+                        end
+                        6'h29: begin // vmadd.vx
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h29;
+                        end
+                        6'h2B: begin // vnmsub.vx
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h2B;
+                        end
+                        6'h2D: begin // vmacc.vx
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h2D;
+                        end
+                        6'h2F: begin // vnmsac.vx
+                            is_vector_arith = 1'b1;
+                            valu_op = 6'h2F;
+                        end
+                        6'h30: begin // vwaddu.vx (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h30;
+                        end
+                        6'h31: begin // vwadd.vx (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h31;
+                        end
+                        6'h32: begin // vwsubu.vx (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h32;
+                        end
+                        6'h33: begin // vwsub.vx (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h33;
+                        end
+                        6'h34: begin // vwaddu.wx (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h34;
+                        end
+                        6'h35: begin // vwadd.wx (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h35;
+                        end
+                        6'h36: begin // vwsubu.wx (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h36;
+                        end
+                        6'h37: begin // vwsub.wx (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h37;
+                        end
+                        6'h38: begin // vwmulu.vx (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h38;
+                        end
+                        6'h3A: begin // vwmulsu.vx (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h3A;
+                        end
+                        6'h3B: begin // vwmul.vx (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h3B;
+                        end
+                        6'h3C: begin // vwmaccu.vx (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h3C;
+                        end
+                        6'h3D: begin // vwmacc.vx (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h3D;
+                        end
+                        6'h3E: begin // vwmaccus.vx (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h3E;
+                        end
+                        6'h3F: begin // vwmaccsu.vx (widening)
+                            is_vector_arith = 1'b1;
+                            is_widening = 1'b1;
+                            valu_op = 6'h3F;
+                        end
+                        default: valu_op = 6'h00;
+                    endcase
+                end
+                
+                //--------------------------------------------------------------
+                // Vector Configuration and Load/Store
+                //--------------------------------------------------------------
+                3'b111: begin // OPCFG - vsetvli/vsetivli/vsetvl
+                    if (inst[31] == 1'b0 && inst[30] == 1'b0) begin // vsetvli
+                        is_vector_config = 1'b1;
+                    end else if (inst[31] == 1'b1 && inst[30] == 1'b1) begin // vsetivli
+                        is_vector_config = 1'b1;
+                    end else if (inst[31] == 1'b1 && inst[30] == 1'b0) begin // vsetvl
+                        is_vector_config = 1'b1;
+                    end
+                end
+                
+                default: begin
+                    // Check for vector loads/stores (LOAD-FP/STORE-FP encoding)
+                    // These use different opcodes but with mop, nf, vm fields
+                    is_vector_inst = 1'b0;
+                end
+            endcase
+        end else if (valid && (opcode == 7'b0000111 || opcode == 7'b0100111)) begin
+            // Vector loads (LOAD-FP opcode) and stores (STORE-FP opcode)
+            is_vector_inst = 1'b1;
+            mop = inst[27:26];
+            nf = inst[31:29];
+            vm = inst[25];
+            
+            // Decode addressing mode
+            unit_stride = (mop == 2'b00);
+            strided = (mop == 2'b10);
+            indexed = (mop == 2'b01 || mop == 2'b11);
+            
+            // Check for segment loads/stores (nf != 0)
+            segment = (nf != 3'b000);
+            
+            // Check for whole register loads/stores (nf == 0 && lumop/sumop special)
+            if (opcode == 7'b0000111) begin // Loads
+                is_vector_load = 1'b1;
+                lumop = inst[24:20];
+                whole_reg = (nf == 3'b000 && mop == 2'b00 && lumop[4:3] == 2'b01);
+                fault_only_first = (nf == 3'b000 && mop == 2'b00 && lumop == 5'b10000);
+            end else begin // Stores
+                is_vector_store = 1'b1;
+                sumop = inst[24:20];
+                whole_reg = (nf == 3'b000 && mop == 2'b00 && sumop[4:3] == 2'b01);
+            end
+        end
+    end
+
+endmodule
+
+FILE: core/vector_lsu.v
+----------------------------------------------------------------------
+//==============================================================================
+// Vector Load/Store Unit
+// Supports unit-stride, strided, and indexed addressing modes
+// Handles element width conversion, alignment, and segment operations
+//==============================================================================
+
+`include "../common/config.vh"
+`include "../common/defines.vh"
+
+module vector_lsu #(
+    parameter VLEN = `VLEN
+)(
+    input wire clk,
+    input wire rst_n,
+    
+    // Control inputs
+    input wire        valid,
+    input wire        is_load,
+    input wire        is_store,
+    input wire        unit_stride,
+    input wire        strided,
+    input wire        indexed,
+    input wire [2:0]  sew,
+    input wire [31:0] vl,
+    input wire [31:0] base_addr,
+    input wire [31:0] stride,          // For strided access
+    input wire [VLEN-1:0] indices,     // For indexed access
+    input wire [2:0]  nf,              // Number of fields (segments)
+    input wire        vm,              // Mask enable (1=unmasked)
+    input wire [VLEN/8-1:0] mask,
+    input wire [4:0]  vd_addr,
+    input wire [4:0]  vs3_addr,
+    
+    // Vector register interface
+    output reg [4:0]         vrf_r_addr,
+    input wire [VLEN-1:0]    vrf_r_data,
+    output reg [4:0]         vrf_w_addr,
+    output reg [VLEN-1:0]    vrf_w_data,
+    output reg               vrf_w_en,
+    
+    // Memory interface
+    output reg [31:0]        mem_addr,
+    output reg [VLEN-1:0]    mem_wdata,
+    output reg [VLEN/8-1:0]  mem_wstrb,
+    output reg               mem_valid,
+    output reg               mem_wen,
+    input  wire [VLEN-1:0]   mem_rdata,
+    input  wire              mem_ready,
+    
+    // Status outputs
+    output reg               busy,
+    output reg               done
+);
+
+    // State machine
+    localparam IDLE       = 3'b000;
+    localparam CALC_ADDR  = 3'b001;
+    localparam MEM_REQ    = 3'b010;
+    localparam MEM_WAIT   = 3'b011;
+    localparam WRITEBACK  = 3'b100;
+    localparam DONE_STATE = 3'b101;
+    
+    reg [2:0] state;
+    reg [31:0] element_count;
+    reg [VLEN-1:0] result_buffer;
+    reg [31:0] segment_idx;
+    
+    // Element width in bytes
+    wire [6:0] elem_bytes = (sew == `SEW_8)  ? 7'd1  :
+                            (sew == `SEW_16) ? 7'd2  :
+                            (sew == `SEW_32) ? 7'd4  : 7'd8;
+    
+    // Calculate memory address for current element
+    reg [31:0] current_addr;
+    always @(*) begin
+        if (unit_stride) begin
+            // Unit-stride: addr = base + elem_count * elem_size * (nf + 1)
+            current_addr = base_addr + (element_count * elem_bytes * (nf + 1)) + (segment_idx * elem_bytes);
+        end else if (strided) begin
+            // Strided: addr = base + elem_count * stride
+            current_addr = base_addr + (element_count * stride) + (segment_idx * elem_bytes);
+        end else if (indexed) begin
+            // Indexed: addr = base + index[elem_count]
+            case (sew)
+                `SEW_8:  current_addr = base_addr + indices[element_count*8 +: 8];
+                `SEW_16: current_addr = base_addr + indices[element_count*16 +: 16];
+                `SEW_32: current_addr = base_addr + indices[element_count*32 +: 32];
+                `SEW_64: current_addr = base_addr + indices[element_count*64 +: 32];
+                default: current_addr = base_addr;
+            endcase
+        end else begin
+            current_addr = base_addr;
+        end
+    end
+    
+    // State machine
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= IDLE;
+            element_count <= 32'b0;
+            segment_idx <= 32'b0;
+            busy <= 1'b0;
+            done <= 1'b0;
+            mem_valid <= 1'b0;
+            mem_wen <= 1'b0;
+            vrf_w_en <= 1'b0;
+            result_buffer <= {VLEN{1'b0}};
+            vrf_r_addr <= 5'b0;
+            vrf_w_addr <= 5'b0;
+        end else begin
+            case (state)
+                IDLE: begin
+                    busy <= 1'b0;
+                    done <= 1'b0;
+                    vrf_w_en <= 1'b0;
+                    
+                    if (valid) begin
+                        element_count <= 32'b0;
+                        segment_idx <= 32'b0;
+                        result_buffer <= {VLEN{1'b0}};
+                        busy <= 1'b1;
+                        
+                        if (is_load) begin
+                            vrf_w_addr <= vd_addr;
+                        end else begin
+                            vrf_r_addr <= vs3_addr;
+                        end
+                        
+                        state <= CALC_ADDR;
+                    end
+                end
+                
+                CALC_ADDR: begin
+                    // Check if current element is masked
+                    if (vm || mask[element_count]) begin
+                        mem_addr <= current_addr;
+                        state <= MEM_REQ;
+                    end else begin
+                        // Skip masked element
+                        if (element_count >= vl - 1) begin
+                            state <= DONE_STATE;
+                        end else begin
+                            element_count <= element_count + 1;
+                            state <= CALC_ADDR;
+                        end
+                    end
+                end
+                
+                MEM_REQ: begin
+                    mem_valid <= 1'b1;
+                    mem_wen <= is_store;
+                    
+                    if (is_store) begin
+                        // Prepare store data
+                        case (sew)
+                            `SEW_8: begin
+                                mem_wdata <= {64{vrf_r_data[element_count*8 +: 8]}};
+                                mem_wstrb <= (64'b1 << current_addr[5:0]);
+                            end
+                            `SEW_16: begin
+                                mem_wdata <= {32{vrf_r_data[element_count*16 +: 16]}};
+                                mem_wstrb <= (64'b11 << current_addr[5:1]);
+                            end
+                            `SEW_32: begin
+                                mem_wdata <= {16{vrf_r_data[element_count*32 +: 32]}};
+                                mem_wstrb <= (64'b1111 << current_addr[5:2]);
+                            end
+                            `SEW_64: begin
+                                mem_wdata <= {8{vrf_r_data[element_count*64 +: 64]}};
+                                mem_wstrb <= (64'b11111111 << current_addr[5:3]);
+                            end
+                        endcase
+                    end
+                    
+                    state <= MEM_WAIT;
+                end
+                
+                MEM_WAIT: begin
+                    if (mem_ready) begin
+                        mem_valid <= 1'b0;
+                        
+                        if (is_load) begin
+                            // Extract loaded data
+                            case (sew)
+                                `SEW_8: begin
+                                    result_buffer[element_count*8 +: 8] <= mem_rdata[(current_addr[5:0])*8 +: 8];
+                                end
+                                `SEW_16: begin
+                                    result_buffer[element_count*16 +: 16] <= mem_rdata[(current_addr[5:1])*16 +: 16];
+                                end
+                                `SEW_32: begin
+                                    result_buffer[element_count*32 +: 32] <= mem_rdata[(current_addr[5:2])*32 +: 32];
+                                end
+                                `SEW_64: begin
+                                    result_buffer[element_count*64 +: 64] <= mem_rdata[(current_addr[5:3])*64 +: 64];
+                                end
+                            endcase
+                        end
+                        
+                        // Check if we need to process more segments
+                        if (segment_idx < nf) begin
+                            segment_idx <= segment_idx + 1;
+                            state <= CALC_ADDR;
+                        end else begin
+                            segment_idx <= 32'b0;
+                            
+                            // Move to next element
+                            if (element_count >= vl - 1) begin
+                                if (is_load) begin
+                                    state <= WRITEBACK;
+                                end else begin
+                                    state <= DONE_STATE;
+                                end
+                            end else begin
+                                element_count <= element_count + 1;
+                                state <= CALC_ADDR;
+                            end
+                        end
+                    end
+                end
+                
+                WRITEBACK: begin
+                    vrf_w_data <= result_buffer;
+                    vrf_w_en <= 1'b1;
+                    state <= DONE_STATE;
+                end
+                
+                DONE_STATE: begin
+                    mem_valid <= 1'b0;
+                    mem_wen <= 1'b0;
+                    vrf_w_en <= 1'b0;
+                    busy <= 1'b0;
+                    done <= 1'b1;
+                    state <= IDLE;
+                end
+                
+                default: state <= IDLE;
+            endcase
+        end
+    end
+
+endmodule
+
+FILE: core/vector_fixedpt_alu.v
+----------------------------------------------------------------------
+//==============================================================================
+// Vector Fixed-Point ALU
+// Supports saturating operations, averaging, scaling shifts, and clipping
+//==============================================================================
+
+`include "../common/config.vh"
+`include "../common/defines.vh"
+
+module vector_fixedpt_alu #(
+    parameter VLEN = `VLEN
+)(
+    input wire clk,
+    input wire rst_n,
+    
+    // Operands
+    input wire [VLEN-1:0]  op_a,
+    input wire [VLEN-1:0]  op_b,
+    input wire [31:0]      scalar_op,
+    input wire [4:0]       imm5,
+    
+    // Control
+    input wire [5:0]       funct6,
+    input wire [2:0]       sew,
+    input wire [31:0]      vl,
+    input wire             use_scalar,
+    input wire             use_imm,
+    input wire [1:0]       vxrm,        // Rounding mode
+    
+    // Mask
+    input wire [VLEN/8-1:0] mask,
+    input wire              mask_en,
+    
+    // Results
+    output reg [VLEN-1:0]   result,
+    output reg              vxsat,      // Saturation flag
+    output reg              valid
+);
+
+    integer i;
+    reg [VLEN-1:0] temp_result;
+    reg temp_vxsat;
+    reg [VLEN-1:0] operand_b;
+    
+    // Prepare operand B
+    always @(*) begin
+        if (use_imm) begin
+            operand_b = {{(VLEN-5){imm5[4]}}, imm5};
+        end else if (use_scalar) begin
+            case (sew)
+                `SEW_8:  operand_b = {64{scalar_op[7:0]}};
+                `SEW_16: operand_b = {32{scalar_op[15:0]}};
+                `SEW_32: operand_b = {16{scalar_op[31:0]}};
+                `SEW_64: operand_b = {8{scalar_op[31:0], 32'b0}};
+                default: operand_b = op_b;
+            endcase
+        end else begin
+            operand_b = op_b;
+        end
+    end
+    
+    // Fixed-point operations
+    always @(*) begin
+        temp_result = {VLEN{1'b0}};
+        temp_vxsat = 1'b0;
+        valid = 1'b1;
+        
+        case (sew)
+            `SEW_8: begin
+                for (i = 0; i < 64; i = i + 1) begin
+                    if (i < vl && (!mask_en || mask[i])) begin
+                        case (funct6)
+                            // Saturating add unsigned
+                            6'h20: begin // vsaddu
+                                temp_result[i*8 +: 8] = (op_a[i*8 +: 8] + operand_b[i*8 +: 8] > 8'hFF) ? 
+                                                        8'hFF : (op_a[i*8 +: 8] + operand_b[i*8 +: 8]);
+                                temp_vxsat = temp_vxsat | ((op_a[i*8 +: 8] + operand_b[i*8 +: 8]) > 8'hFF);
+                            end
+                            
+                            // Saturating add signed
+                            6'h21: begin // vsadd
+                                reg signed [8:0] sum;
+                                sum = $signed({1'b0, op_a[i*8 +: 8]}) + $signed({1'b0, operand_b[i*8 +: 8]});
+                                if (sum > $signed(9'sh7F)) begin
+                                    temp_result[i*8 +: 8] = 8'h7F;
+                                    temp_vxsat = 1'b1;
+                                end else if (sum < $signed(-9'sh80)) begin
+                                    temp_result[i*8 +: 8] = 8'h80;
+                                    temp_vxsat = 1'b1;
+                                end else begin
+                                    temp_result[i*8 +: 8] = sum[7:0];
+                                end
+                            end
+                            
+                            // Saturating subtract unsigned
+                            6'h22: begin // vssubu
+                                temp_result[i*8 +: 8] = (op_a[i*8 +: 8] < operand_b[i*8 +: 8]) ? 
+                                                        8'h00 : (op_a[i*8 +: 8] - operand_b[i*8 +: 8]);
+                                temp_vxsat = temp_vxsat | (op_a[i*8 +: 8] < operand_b[i*8 +: 8]);
+                            end
+                            
+                            // Saturating subtract signed
+                            6'h23: begin // vssub
+                                reg signed [8:0] diff;
+                                diff = $signed({1'b0, op_a[i*8 +: 8]}) - $signed({1'b0, operand_b[i*8 +: 8]});
+                                if (diff > $signed(9'sh7F)) begin
+                                    temp_result[i*8 +: 8] = 8'h7F;
+                                    temp_vxsat = 1'b1;
+                                end else if (diff < $signed(-9'sh80)) begin
+                                    temp_result[i*8 +: 8] = 8'h80;
+                                    temp_vxsat = 1'b1;
+                                end else begin
+                                    temp_result[i*8 +: 8] = diff[7:0];
+                                end
+                            end
+                            
+                            // Averaging add unsigned
+                            6'h08: begin // vaaddu
+                                temp_result[i*8 +: 8] = (op_a[i*8 +: 8] + operand_b[i*8 +: 8] + 1) >> 1;
+                            end
+                            
+                            // Averaging add signed
+                            6'h09: begin // vaadd
+                                temp_result[i*8 +: 8] = ($signed(op_a[i*8 +: 8]) + $signed(operand_b[i*8 +: 8]) + 1) >>> 1;
+                            end
+                            
+                            // Averaging subtract unsigned
+                            6'h0A: begin // vasubu
+                                temp_result[i*8 +: 8] = (op_a[i*8 +: 8] - operand_b[i*8 +: 8]) >> 1;
+                            end
+                            
+                            // Averaging subtract signed
+                            6'h0B: begin // vasub
+                                temp_result[i*8 +: 8] = ($signed(op_a[i*8 +: 8]) - $signed(operand_b[i*8 +: 8])) >>> 1;
+                            end
+                            
+                            // Scaling shift right (with rounding)
+                            6'h2A: begin // vssrl
+                                reg [7:0] shift_amt;
+                                reg [7:0] shifted;
+                                reg round_bit;
+                                shift_amt = operand_b[i*8 +: 3];
+                                shifted = op_a[i*8 +: 8] >> shift_amt;
+                                round_bit = (shift_amt > 0) ? op_a[i*8 + (shift_amt-1)] : 1'b0;
+                                // Apply rounding based on vxrm
+                                case (vxrm)
+                                    2'b00: temp_result[i*8 +: 8] = shifted + round_bit; // RNU
+                                    2'b01: temp_result[i*8 +: 8] = shifted + (round_bit & shifted[0]); // RNE
+                                    2'b10: temp_result[i*8 +: 8] = shifted; // RDN
+                                    2'b11: temp_result[i*8 +: 8] = shifted + round_bit; // ROD
+                                endcase
+                            end
+                            
+                            // Scaling shift right arithmetic
+                            6'h2B: begin // vssra
+                                reg [7:0] shift_amt;
+                                reg signed [7:0] shifted;
+                                reg round_bit;
+                                shift_amt = operand_b[i*8 +: 3];
+                                shifted = $signed(op_a[i*8 +: 8]) >>> shift_amt;
+                                round_bit = (shift_amt > 0) ? op_a[i*8 + (shift_amt-1)] : 1'b0;
+                                case (vxrm)
+                                    2'b00: temp_result[i*8 +: 8] = shifted + round_bit;
+                                    2'b01: temp_result[i*8 +: 8] = shifted + (round_bit & shifted[0]);
+                                    2'b10: temp_result[i*8 +: 8] = shifted;
+                                    2'b11: temp_result[i*8 +: 8] = shifted + round_bit;
+                                endcase
+                            end
+                            
+                            default: temp_result[i*8 +: 8] = 8'b0;
+                        endcase
+                    end
+                end
+            end
+            
+            `SEW_16: begin
+                for (i = 0; i < 32; i = i + 1) begin
+                    if (i < vl && (!mask_en || mask[i])) begin
+                        case (funct6)
+                            6'h20: begin
+                                temp_result[i*16 +: 16] = (op_a[i*16 +: 16] + operand_b[i*16 +: 16] > 16'hFFFF) ? 
+                                                          16'hFFFF : (op_a[i*16 +: 16] + operand_b[i*16 +: 16]);
+                                temp_vxsat = temp_vxsat | ((op_a[i*16 +: 16] + operand_b[i*16 +: 16]) > 16'hFFFF);
+                            end
+                            6'h21: begin
+                                reg signed [16:0] sum;
+                                sum = $signed({1'b0, op_a[i*16 +: 16]}) + $signed({1'b0, operand_b[i*16 +: 16]});
+                                if (sum > $signed(17'sh7FFF)) begin
+                                    temp_result[i*16 +: 16] = 16'h7FFF;
+                                    temp_vxsat = 1'b1;
+                                end else if (sum < $signed(-17'sh8000)) begin
+                                    temp_result[i*16 +: 16] = 16'h8000;
+                                    temp_vxsat = 1'b1;
+                                end else begin
+                                    temp_result[i*16 +: 16] = sum[15:0];
+                                end
+                            end
+                            6'h08: temp_result[i*16 +: 16] = (op_a[i*16 +: 16] + operand_b[i*16 +: 16] + 1) >> 1;
+                            6'h09: temp_result[i*16 +: 16] = ($signed(op_a[i*16 +: 16]) + $signed(operand_b[i*16 +: 16]) + 1) >>> 1;
+                            default: temp_result[i*16 +: 16] = 16'b0;
+                        endcase
+                    end
+                end
+            end
+            
+            `SEW_32: begin
+                for (i = 0; i < 16; i = i + 1) begin
+                    if (i < vl && (!mask_en || mask[i])) begin
+                        case (funct6)
+                            6'h20: begin
+                                reg [32:0] sum;
+                                sum = {1'b0, op_a[i*32 +: 32]} + {1'b0, operand_b[i*32 +: 32]};
+                                temp_result[i*32 +: 32] = sum[32] ? 32'hFFFFFFFF : sum[31:0];
+                                temp_vxsat = temp_vxsat | sum[32];
+                            end
+                            6'h21: begin
+                                reg signed [32:0] sum;
+                                sum = $signed({op_a[i*32+31], op_a[i*32 +: 32]}) + 
+                                      $signed({operand_b[i*32+31], operand_b[i*32 +: 32]});
+                                if (sum > $signed(33'sh7FFFFFFF)) begin
+                                    temp_result[i*32 +: 32] = 32'h7FFFFFFF;
+                                    temp_vxsat = 1'b1;
+                                end else if (sum < $signed(-33'sh80000000)) begin
+                                    temp_result[i*32 +: 32] = 32'h80000000;
+                                    temp_vxsat = 1'b1;
+                                end else begin
+                                    temp_result[i*32 +: 32] = sum[31:0];
+                                end
+                            end
+                            6'h08: temp_result[i*32 +: 32] = ({1'b0, op_a[i*32 +: 32]} + {1'b0, operand_b[i*32 +: 32]} + 1) >> 1;
+                            6'h09: temp_result[i*32 +: 32] = ($signed(op_a[i*32 +: 32]) + $signed(operand_b[i*32 +: 32]) + 1) >>> 1;
+                            default: temp_result[i*32 +: 32] = 32'b0;
+                        endcase
+                    end
+                end
+            end
+            
+            `SEW_64: begin
+                for (i = 0; i < 8; i = i + 1) begin
+                    if (i < vl && (!mask_en || mask[i])) begin
+                        case (funct6)
+                            6'h08: temp_result[i*64 +: 64] = ({1'b0, op_a[i*64 +: 64]} + {1'b0, operand_b[i*64 +: 64]} + 1) >> 1;
+                            6'h09: temp_result[i*64 +: 64] = ($signed(op_a[i*64 +: 64]) + $signed(operand_b[i*64 +: 64]) + 1) >>> 1;
+                            default: temp_result[i*64 +: 64] = 64'b0;
+                        endcase
+                    end
+                end
+            end
+        endcase
+    end
+    
+    // Register output
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            result <= {VLEN{1'b0}};
+            vxsat <= 1'b0;
+        end else begin
+            result <= temp_result;
+            vxsat <= temp_vxsat;
+        end
+    end
+
+endmodule
+
+FILE: mmu/mmu.v
+----------------------------------------------------------------------
+//==============================================================================
+// Memory Management Unit (MMU)
+// Single-stage address translation with TLB
+//==============================================================================
+
+`include "../common/config.vh"
+`include "../common/defines.vh"
+
+module mmu (
+    input wire clk,
+    input wire rst_n,
+    
+    // Translation request
+    input wire [`VADDR_WIDTH-1:0]  vaddr,
+    output reg [`PADDR_WIDTH-1:0]  paddr,
+    input wire                     req,
+    input wire                     wen,
+    output reg                     ready,
+    output reg                     fault,
+    
+    // Page table walker memory interface
+    output reg [31:0]              ptw_mem_addr,
+    output reg                     ptw_mem_valid,
+    input wire [31:0]              ptw_mem_rdata,
+    input wire                     ptw_mem_ready
+);
+
+    // TLB storage
+    reg [`VADDR_WIDTH-`PAGE_OFFSET_BITS-1:0] tlb_vpn [`TLB_ENTRIES-1:0];
+    reg [`PADDR_WIDTH-`PAGE_OFFSET_BITS-1:0] tlb_ppn [`TLB_ENTRIES-1:0];
+    reg [7:0]                                  tlb_flags [`TLB_ENTRIES-1:0];
+    reg                                        tlb_valid [`TLB_ENTRIES-1:0];
+    reg [`TLB_INDEX_BITS-1:0]                 tlb_lru [`TLB_ENTRIES-1:0];
+    
+    // Current request VPN and offset
+    wire [`VADDR_WIDTH-`PAGE_OFFSET_BITS-1:0] req_vpn = vaddr[`VADDR_WIDTH-1:`PAGE_OFFSET_BITS];
+    wire [`PAGE_OFFSET_BITS-1:0]               req_offset = vaddr[`PAGE_OFFSET_BITS-1:0];
+    
+    // TLB lookup
+    reg                     tlb_hit;
+    reg [`TLB_INDEX_BITS-1:0] tlb_hit_idx;
+    reg [`PADDR_WIDTH-`PAGE_OFFSET_BITS-1:0] tlb_hit_ppn;
+    reg [7:0]               tlb_hit_flags;
+    
+    integer i, j;
+    
+    // State machine
+    reg [2:0] state;
+    
+    // TLB lookup logic
+    always @(*) begin
+        tlb_hit = 1'b0;
+        tlb_hit_idx = {`TLB_INDEX_BITS{1'b0}};
+        tlb_hit_ppn = {(`PADDR_WIDTH-`PAGE_OFFSET_BITS){1'b0}};
+        tlb_hit_flags = 8'b0;
+        
+        for (i = 0; i < `TLB_ENTRIES; i = i + 1) begin
+            if (tlb_valid[i] && (tlb_vpn[i] == req_vpn)) begin
+                tlb_hit = 1'b1;
+                tlb_hit_idx = i;
+                tlb_hit_ppn = tlb_ppn[i];
+                tlb_hit_flags = tlb_flags[i];
+            end
+        end
+    end
+    
+    // State machine
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= `MMU_IDLE;
+            paddr <= {`PADDR_WIDTH{1'b0}};
+            ready <= 1'b0;
+            fault <= 1'b0;
+            ptw_mem_valid <= 1'b0;
+            
+            for (i = 0; i < `TLB_ENTRIES; i = i + 1) begin
+                tlb_valid[i] <= 1'b0;
+                tlb_lru[i] <= i;
+            end
+        end else begin
+            case (state)
+                `MMU_IDLE: begin
+                    ready <= 1'b0;
+                    fault <= 1'b0;
+                    if (req) begin
+                        state <= `MMU_TLB_LOOKUP;
+                    end
+                end
+                
+                `MMU_TLB_LOOKUP: begin
+                    if (tlb_hit) begin
+                        // Check permissions
+                        if ((wen && !tlb_hit_flags[`PTE_W]) || 
+                            (!wen && !tlb_hit_flags[`PTE_R])) begin
+                            fault <= 1'b1;
+                            state <= `MMU_FAULT;
+                        end else begin
+                            paddr <= {tlb_hit_ppn, req_offset};
+                            ready <= 1'b1;
+                            state <= `MMU_IDLE;
+                            
+                            // Update LRU
+                            for (j = 0; j < `TLB_ENTRIES; j = j + 1) begin
+                                if (j == tlb_hit_idx) begin
+                                    tlb_lru[j] <= `TLB_ENTRIES - 1;
+                                end else if (tlb_lru[j] > tlb_lru[tlb_hit_idx]) begin
+                                    tlb_lru[j] <= tlb_lru[j] - 1;
+                                end
+                            end
+                        end
+                    end else begin
+                        // TLB miss - for now, just pass through (identity mapping)
+                        paddr <= vaddr;
+                        ready <= 1'b1;
+                        state <= `MMU_IDLE;
+                    end
+                end
+                
+                `MMU_FAULT: begin
+                    ready <= 1'b1;
+                    state <= `MMU_IDLE;
+                end
+                
+                default: state <= `MMU_IDLE;
+            endcase
+        end
+    end
+
+endmodule
+
