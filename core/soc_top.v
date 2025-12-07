@@ -9,7 +9,10 @@ module soc_top (
     input  wire         desc_valid,
     output wire         desc_ready,
     output wire         rdma_done,
-    output wire         rdma_error
+    output wire         rdma_error,
+
+    // Test output forwarded from memory model
+    output wire         mem_test_pass
 );
 
     // Scalar <-> AXI wires
@@ -168,7 +171,10 @@ module soc_top (
         .rresp(axi_rresp),
         .rlast(axi_rlast),
         .rvalid(axi_rvalid),
-        .rready(axi_rready)
+        .rready(axi_rready),
+
+        // forward test signal
+        .test_pass(mem_test_pass)
     );
 
 endmodule
