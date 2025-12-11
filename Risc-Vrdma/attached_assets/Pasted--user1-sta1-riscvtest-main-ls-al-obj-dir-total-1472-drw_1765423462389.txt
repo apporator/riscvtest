@@ -1,0 +1,40 @@
+[user1@sta1 riscvtest-main]$ ls -al obj_dir/
+total 1472
+drwxr-xr-x 2 user1 user1   4096 Dec  7 02:50 .
+drwxr-xr-x 9 user1 user1   4096 Dec  7 02:54 ..
+-rw-r--r-- 1 user1 user1    598 Dec  7 02:50 verilated.d
+-rw-r--r-- 1 user1 user1 230424 Dec  7 02:50 verilated.o
+-rw-r--r-- 1 user1 user1    365 Dec  7 02:50 verilated_threads.d
+-rw-r--r-- 1 user1 user1  54928 Dec  7 02:50 verilated_threads.o
+-rw-r--r-- 1 user1 user1    570 Dec  7 02:50 verilated_vcd_c.d
+-rw-r--r-- 1 user1 user1 119024 Dec  7 02:50 verilated_vcd_c.o
+-rw-r--r-- 1 user1 user1    436 Dec  7 02:50 verilator_tb.d
+-rw-r--r-- 1 user1 user1  11640 Dec  7 02:50 verilator_tb.o
+-rwxr-xr-x 1 user1 user1 297760 Dec  7 02:50 Vsoc_top
+-rw-r--r-- 1 user1 user1   1255 Dec  7 02:48 Vsoc_top___024root__DepSet_h65df8dc1__0.cpp
+-rw-r--r-- 1 user1 user1    889 Dec  7 02:48 Vsoc_top___024root__DepSet_h65df8dc1__0__Slow.cpp
+-rw-r--r-- 1 user1 user1 114110 Dec  7 02:48 Vsoc_top___024root__DepSet_h791d01ee__0.cpp
+-rw-r--r-- 1 user1 user1  21259 Dec  7 02:48 Vsoc_top___024root__DepSet_h791d01ee__0__Slow.cpp
+-rw-r--r-- 1 user1 user1 196251 Dec  7 02:44 Vsoc_top___024root__DepSet_h791d01ee__1.cpp
+-rw-r--r-- 1 user1 user1  25868 Dec  7 02:44 Vsoc_top___024root__DepSet_h791d01ee__1__Slow.cpp
+-rw-r--r-- 1 user1 user1   8049 Dec  7 02:48 Vsoc_top___024root.h
+-rw-r--r-- 1 user1 user1    672 Dec  7 02:48 Vsoc_top___024root__Slow.cpp
+-rw-r--r-- 1 user1 user1 116550 Dec  7 02:50 Vsoc_top__ALL.a
+-rw-r--r-- 1 user1 user1    574 Dec  7 02:50 Vsoc_top__ALL.cpp
+-rw-r--r-- 1 user1 user1    867 Dec  7 02:50 Vsoc_top__ALL.d
+-rw-r--r-- 1 user1 user1 110552 Dec  7 02:50 Vsoc_top__ALL.o
+-rw-r--r-- 1 user1 user1   1895 Dec  7 02:48 Vsoc_top_classes.mk
+-rw-r--r-- 1 user1 user1  11082 Dec  7 02:48 Vsoc_top__ConstPool_0.cpp
+-rw-r--r-- 1 user1 user1   5474 Dec  7 02:48 Vsoc_top.cpp
+-rw-r--r-- 1 user1 user1   3765 Dec  7 02:48 Vsoc_top.h
+-rw-r--r-- 1 user1 user1   1989 Dec  7 02:48 Vsoc_top.mk
+-rw-r--r-- 1 user1 user1    766 Dec  7 02:48 Vsoc_top__pch.h
+-rw-r--r-- 1 user1 user1    832 Dec  7 02:48 Vsoc_top__Syms.cpp
+-rw-r--r-- 1 user1 user1   1128 Dec  7 02:48 Vsoc_top__Syms.h
+-rw-r--r-- 1 user1 user1  15803 Dec  7 02:48 Vsoc_top__Trace__0.cpp
+-rw-r--r-- 1 user1 user1  56030 Dec  7 02:48 Vsoc_top__Trace__0__Slow.cpp
+-rw-r--r-- 1 user1 user1    302 Dec  7 02:48 Vsoc_top__TraceDecls__0__Slow.cpp
+-rw-r--r-- 1 user1 user1    982 Dec  7 02:48 Vsoc_top__ver.d
+-rw-r--r-- 1 user1 user1   4403 Dec  7 02:48 Vsoc_top__verFiles.dat
+[user1@sta1 riscvtest-main]$ ./obj_dir/Vsoc_top
+TEST TIMED OUT after 600016 ticks
